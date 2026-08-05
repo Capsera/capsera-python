@@ -1,0 +1,108 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "capsera"
+dynamic = ["version"]
+description = "Per-agent token attribution and budget enforcement for multi-agent LLM systems"
+readme = "README.md"
+requires-python = ">=3.11"
+# PEP 639 form. The deprecated `license = { text = "MIT" }` table still builds
+# but twine warns on it, and the `License ::` trove classifier must NOT be used
+# alongside a license expression — PyPI rejects the combination.
+license = "Apache-2.0"
+# NOTICE ships alongside LICENSE because Apache-2.0 §4(d) requires
+# redistributions to carry it when the original work has one.
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Capsera" }]
+keywords = [
+    "llm", "finops", "observability", "cost", "tokens", "budget",
+    "anthropic", "openai", "agents", "attribution",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.27.0",
+]
+
+[project.urls]
+Homepage = "https://capsera.ai"
+Dashboard = "https://app.capsera.ai"
+Repository = "https://github.com/Capsera/Token-Budget-Manager"
+Issues = "https://github.com/Capsera/Token-Budget-Manager/issues"
+
+[tool.hatch.version]
+path = "capsera/_version.py"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3.12",
+    "ruff>=0.4",
+    "mypy>=1.9",
+    "jsonschema>=4.21",
+]
+# Real provider client libraries — used by the contract layer (tests/contract,
+# real clients against a local mock server) and the live smoke suite
+# (tests/live, real APIs, gated on CAPSERA_TEST_LIVE=1). Never runtime deps.
+test-providers = [
+    "anthropic>=0.40",
+    "openai>=1.60",
+    "google-genai>=1.0",
+    "google-generativeai>=0.8",
+    "mistralai>=1.2",
+    "cohere>=5.13",
+    "boto3>=1.39",          # >=1.39 for AWS_BEARER_TOKEN_BEDROCK support
+]
+# AI frameworks the interceptor must survive — used by framework contract
+# tests and the evals corpus (langchain/langgraph pins match evals/generator.py).
+test-frameworks = [
+    "langchain>=1.3,<2",
+    "langchain-openai>=1.3,<2",
+    "langchain-anthropic>=1.4,<2",
+    "langgraph>=1.2,<2",
+    "crewai>=0.80",
+    "llama-index-core>=0.12",
+    "llama-index-llms-openai>=0.3",
+    "pyautogen>=0.4",
+    "haystack-ai>=2.8",
+    "dspy>=2.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["capsera"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    # A worker thread dying mid-test must fail the test, not pass vacuously —
+    # thread-isolation tests assert nothing if their workers crash early.
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+]
