@@ -208,6 +208,80 @@ def _host_provider(base_url: str | None) -> str | None:
     return None
 
 
+# --------------------------------------------------------------------------- #
+# AI gateways
+#
+# Gateways (LiteLLM proxy, Portkey, Bifrost, OpenRouter, Helicone, Cloudflare
+# AI Gateway, ...) sit BETWEEN the caller and the provider. They are a
+# dimension orthogonal to ``provider``: an event routed through OpenRouter to
+# Anthropic has provider="openrouter" (existing capture behaviour, unchanged)
+# and gateway="openrouter" (new). TokenEvent.gateway lets the dashboard slice
+# spend by gateway without disturbing provider-based pricing/attribution.
+# --------------------------------------------------------------------------- #
+
+# Host substrings → gateway name. Only unambiguous signals belong here: a
+# generic localhost port would mislabel every dev server, so self-hosted
+# gateways with vanity hostnames are covered by ``capsera.init(gateway=...)``
+# instead. localhost:4000 is LiteLLM proxy's documented default bind and is
+# specific enough to keep.
+GATEWAY_HOSTS: tuple[tuple[str, str], ...] = (
+    ("openrouter.ai", "openrouter"),
+    ("portkey.ai", "portkey"),
+    ("helicone.ai", "helicone"),
+    ("gateway.ai.cloudflare.com", "cloudflare"),
+    ("litellm", "litellm"),
+    ("localhost:4000", "litellm"),
+    ("127.0.0.1:4000", "litellm"),
+    ("bifrost", "bifrost"),
+    ("kong", "kong"),
+)
+
+
+def gateway_for(base_url: str | None) -> str | None:
+    """Resolve the AI gateway a call rode through, from the client base_url.
+
+    Returns None when the URL matches no known gateway — callers fall back to
+    ``Config.default_gateway`` (the explicit ``init(gateway=...)`` override for
+    self-hosted deployments the host list cannot recognise).
+    """
+    if not base_url:
+        return None
+    parsed = urlparse(base_url if "//" in base_url else "//" + base_url)
+    hay = (parsed.netloc + parsed.path).lower()
+    for needle, gateway in GATEWAY_HOSTS:
+        if needle in hay:
+            return gateway
+    return None
+
+
+# Vendor prefixes used by gateway-style model IDs ("anthropic/claude-...",
+# "openrouter/openai/gpt-4o"). Stripping is a LAST-resort fallback after
+# exact/prefix lookup fails, so real catalog keys containing "/" (Together's
+# "meta-llama/...", Fireworks' "accounts/fireworks/...") are never affected —
+# they match exactly first.
+_VENDOR_PREFIXES = frozenset({
+    "anthropic", "openai", "azure", "azure_ai", "google", "gemini",
+    "vertex_ai", "vertex", "bedrock", "groq", "mistral", "mistralai",
+    "deepseek", "xai", "x-ai", "together_ai", "fireworks_ai", "perplexity",
+    "cohere", "openrouter", "ollama", "meta", "cerebras", "sambanova",
+})
+
+
+def strip_vendor_prefix(model: str) -> str:
+    """Strip up to two leading "<vendor>/" segments from a gateway model ID.
+
+    "openrouter/anthropic/claude-sonnet-4-6" → "claude-sonnet-4-6";
+    IDs whose head is not a known vendor come back unchanged.
+    """
+    for _ in range(2):
+        head, sep, rest = model.partition("/")
+        if sep and rest and head.lower() in _VENDOR_PREFIXES:
+            model = rest
+        else:
+            break
+    return model
+
+
 def model_meta(model: str) -> ModelMeta | None:
     """Metadata for a model ID, exact then prefix match (mirrors get_pricing)."""
     if model in MODELS:
@@ -215,6 +289,11 @@ def model_meta(model: str) -> ModelMeta | None:
     for key, meta in MODELS.items():
         if model.startswith(key):
             return meta
+    # Gateway-style ID ("anthropic/claude-sonnet-4-6") — retry without the
+    # vendor prefix so provider/tier resolution works through gateways.
+    stripped = strip_vendor_prefix(model)
+    if stripped != model:
+        return model_meta(stripped)
     return None
 
 

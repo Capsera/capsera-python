@@ -22,7 +22,6 @@ import pytest
 
 from capsera._config import Config
 from capsera._interceptor import Interceptor
-
 from tests.conftest import CapturingEmitter
 
 _REPO = Path(__file__).resolve().parents[3]

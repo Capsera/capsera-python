@@ -3,11 +3,13 @@ Unit tests for the pricing module.
 """
 from __future__ import annotations
 
+import sys
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
-from capsera._pricing import PRICING, ModelPricing, compute_cost, get_pricing
+from capsera._pricing import ModelPricing, compute_cost, get_pricing
 
 
 class TestGetPricing:
@@ -25,6 +27,49 @@ class TestGetPricing:
         # Fallback values
         assert p.input_per_1k == Decimal("0.001")
         assert p.output_per_1k == Decimal("0.003")
+
+
+class TestExternalPricingFallback:
+    """For models absent from Capsera's own table, fall back to LiteLLM's
+    maintained ``model_cost`` map — but only when litellm is already loaded,
+    and never overriding models we do carry."""
+
+    def test_uses_litellm_model_cost_when_loaded(self, monkeypatch) -> None:
+        fake = SimpleNamespace(model_cost={
+            "acme-llm-x": {"input_cost_per_token": 0.000002, "output_cost_per_token": 0.000008},
+        })
+        monkeypatch.setitem(sys.modules, "litellm", fake)
+        p = get_pricing("acme-llm-x")
+        assert p.input_per_1k == Decimal("0.002")     # per-token → per-1k
+        assert p.output_per_1k == Decimal("0.008")
+
+    def test_vendor_prefixed_model_resolves(self, monkeypatch) -> None:
+        fake = SimpleNamespace(model_cost={
+            "acme-llm-x": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000003},
+        })
+        monkeypatch.setitem(sys.modules, "litellm", fake)
+        p = get_pricing("openrouter/acme-llm-x")
+        assert p.input_per_1k == Decimal("0.001")
+
+    def test_absent_litellm_uses_generic_fallback(self, monkeypatch) -> None:
+        monkeypatch.setitem(sys.modules, "litellm", None)   # simulate not-loaded
+        p = get_pricing("totally-unknown-model-zzz")
+        assert p.input_per_1k == Decimal("0.001")
+        assert p.output_per_1k == Decimal("0.003")
+
+    def test_capsera_table_wins_over_external(self, monkeypatch) -> None:
+        # A model we DO carry must never be repriced from the external source.
+        fake = SimpleNamespace(model_cost={
+            "gpt-4o": {"input_cost_per_token": 9.0, "output_cost_per_token": 9.0},
+        })
+        monkeypatch.setitem(sys.modules, "litellm", fake)
+        assert get_pricing("gpt-4o").input_per_1k == Decimal("0.0025")
+
+    def test_malformed_external_entry_falls_through(self, monkeypatch) -> None:
+        fake = SimpleNamespace(model_cost={"acme-llm-x": "not-a-dict"})
+        monkeypatch.setitem(sys.modules, "litellm", fake)
+        p = get_pricing("acme-llm-x")
+        assert p.input_per_1k == Decimal("0.001")   # generic fallback
 
 
 class TestComputeCost:

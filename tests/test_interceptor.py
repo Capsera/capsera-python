@@ -16,9 +16,10 @@ Strategy
 """
 from __future__ import annotations
 
+import asyncio
 import sys
-import time
 import threading
+import time
 from decimal import Decimal
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -28,7 +29,7 @@ import pytest
 
 import capsera
 from capsera._config import Config
-from capsera._context import _context_stack, AgentContext
+from capsera._context import AgentContext, _context_stack
 from capsera._emitter import Emitter
 from capsera._interceptor import Interceptor
 from capsera._models import TokenEvent
@@ -38,7 +39,6 @@ from .conftest import (
     make_anthropic_response,
     make_openai_response,
 )
-
 
 # =========================================================================== #
 # Helper — build a fake "anthropic" module
@@ -152,6 +152,11 @@ def _make_fake_google_genai_module(response: Any) -> tuple[ModuleType, ModuleTyp
     fake_google.genai = fake_genai
     fake_genai.models = fake_models_mod
 
+    # Streaming: only the FINAL chunk carries usage_metadata, mirroring the
+    # real SDK's accounting.
+    chunk_no_usage = MagicMock()
+    chunk_no_usage.usage_metadata = None
+
     class FakeModels:
         last_kwargs: dict[str, Any] | None = None
 
@@ -159,7 +164,31 @@ def _make_fake_google_genai_module(response: Any) -> tuple[ModuleType, ModuleTyp
             self.__class__.last_kwargs = kwargs
             return response
 
+        def generate_content_stream(self, **kwargs: Any) -> Any:
+            self.__class__.last_kwargs = kwargs
+            yield chunk_no_usage
+            yield response
+
+    class FakeAsyncModels:
+        last_kwargs: dict[str, Any] | None = None
+
+        async def generate_content(self, **kwargs: Any) -> Any:
+            self.__class__.last_kwargs = kwargs
+            return response
+
+        # Real google-genai convention: an `async def` that RETURNS an async
+        # iterator (callers `await` it, then `async for`).
+        async def generate_content_stream(self, **kwargs: Any) -> Any:
+            self.__class__.last_kwargs = kwargs
+
+            async def _iter():
+                yield chunk_no_usage
+                yield response
+
+            return _iter()
+
     fake_models_mod.Models = FakeModels
+    fake_models_mod.AsyncModels = FakeAsyncModels
     return fake_google, fake_genai, fake_models_mod
 
 
@@ -636,6 +665,132 @@ class TestGoogleGemini:
         assert events[0].input_tokens == 111
         assert events[0].output_tokens == 44
 
+    def test_google_genai_async_event_emitted(
+        self, config: Config, emitter: CapturingEmitter
+    ) -> None:
+        """`await client.aio.models.generate_content(...)` — the surface an
+        async app (e.g. an AutoGen ChatCompletionClient adapter) actually
+        calls. Patching only the sync Models class left it invisible."""
+        response = make_google_response(
+            model="gemini-2.0-flash", input_tokens=88, output_tokens=33
+        )
+        fake_google, fake_genai, fake_models_mod = _make_fake_google_genai_module(response)
+
+        with patch.dict(sys.modules, {
+            "google": fake_google,
+            "google.genai": fake_genai,
+            "google.genai.models": fake_models_mod,
+        }):
+            interceptor = Interceptor(config, emitter)
+            assert interceptor._patch_google_genai(fake_genai) is True
+
+            models = fake_genai.models.AsyncModels()
+            result = asyncio.run(
+                models.generate_content(model="gemini-2.0-flash", contents="hello")
+            )
+
+        assert result is response
+        events = emitter.drain()
+        assert len(events) == 1
+        assert events[0].provider == "google"
+        assert events[0].input_tokens == 88
+        assert events[0].output_tokens == 33
+        assert events[0].cost_usd > 0
+
+    def test_google_genai_async_call_carries_agent_context(
+        self, config: Config, emitter: CapturingEmitter
+    ) -> None:
+        """The bi-copilot shape end-to-end: an AutoGen model client wrapped in
+        capsera.autogen_agent() makes an async Gemini call — the emitted event
+        must be attributed to the wrapped agent, not 'unknown'."""
+        import capsera as capsera_pkg
+
+        response = make_google_response(input_tokens=10, output_tokens=5)
+        fake_google, fake_genai, fake_models_mod = _make_fake_google_genai_module(response)
+
+        with patch.dict(sys.modules, {
+            "google": fake_google,
+            "google.genai": fake_genai,
+            "google.genai.models": fake_models_mod,
+        }):
+            interceptor = Interceptor(config, emitter)
+            assert interceptor._patch_google_genai(fake_genai) is True
+
+            class GeminiAdapter:
+                """Duck-typed stand-in for an AutoGen ChatCompletionClient."""
+
+                def __init__(self) -> None:
+                    self._models = fake_genai.models.AsyncModels()
+
+                async def create(self, messages: Any) -> Any:
+                    return await self._models.generate_content(
+                        model="gemini-2.0-flash", contents=messages
+                    )
+
+            wrapped = capsera_pkg.autogen_agent(GeminiAdapter(), name="critic", team="bi")
+            asyncio.run(wrapped.create([{"role": "user", "content": "review"}]))
+
+        events = emitter.drain()
+        assert len(events) == 1
+        assert events[0].agent_id == "critic"
+        assert events[0].team_id == "bi"
+        assert events[0].provider == "google"
+
+    def test_google_genai_sync_stream_emits_final_usage(
+        self, config: Config, emitter: CapturingEmitter
+    ) -> None:
+        response = make_google_response(input_tokens=60, output_tokens=21)
+        fake_google, fake_genai, fake_models_mod = _make_fake_google_genai_module(response)
+
+        with patch.dict(sys.modules, {
+            "google": fake_google,
+            "google.genai": fake_genai,
+            "google.genai.models": fake_models_mod,
+        }):
+            interceptor = Interceptor(config, emitter)
+            assert interceptor._patch_google_genai(fake_genai) is True
+
+            models = fake_genai.models.Models()
+            chunks = list(
+                models.generate_content_stream(model="gemini-2.0-flash", contents="hi")
+            )
+
+        assert chunks[-1] is response
+        events = emitter.drain()
+        assert len(events) == 1
+        assert events[0].input_tokens == 60
+        assert events[0].output_tokens == 21
+
+    def test_google_genai_async_stream_emits_final_usage(
+        self, config: Config, emitter: CapturingEmitter
+    ) -> None:
+        response = make_google_response(input_tokens=70, output_tokens=28)
+        fake_google, fake_genai, fake_models_mod = _make_fake_google_genai_module(response)
+
+        with patch.dict(sys.modules, {
+            "google": fake_google,
+            "google.genai": fake_genai,
+            "google.genai.models": fake_models_mod,
+        }):
+            interceptor = Interceptor(config, emitter)
+            assert interceptor._patch_google_genai(fake_genai) is True
+
+            models = fake_genai.models.AsyncModels()
+
+            async def consume() -> list:
+                stream = await models.generate_content_stream(
+                    model="gemini-2.0-flash", contents="hi"
+                )
+                return [chunk async for chunk in stream]
+
+            chunks = asyncio.run(consume())
+
+        assert chunks[-1] is response
+        events = emitter.drain()
+        assert len(events) == 1
+        assert events[0].input_tokens == 70
+        assert events[0].output_tokens == 28
+
     def test_google_genai_alias_resolves_to_model_version(
         self, config: Config, emitter: CapturingEmitter
     ) -> None:
@@ -679,8 +834,6 @@ class TestInit:
         We capture it by monkey-patching Emitter._send.
         """
         captured: list[TokenEvent] = []
-
-        original_send = Emitter._send
 
         def capture_send(self, events):  # type: ignore[override]
             captured.extend(events)
@@ -784,14 +937,12 @@ class TestPricing:
 
 class TestContextStack:
     def test_push_pop(self) -> None:
-        from capsera._context import _context_stack
         assert _context_stack.current() is None or True  # may have leftover state
         _context_stack.push(AgentContext(agent="a1"))
         assert _context_stack.current().agent == "a1"
         _context_stack.pop()
 
     def test_nesting(self) -> None:
-        from capsera._context import _context_stack
         _context_stack.push(AgentContext(agent="outer"))
         _context_stack.push(AgentContext(agent="inner"))
         assert _context_stack.current().agent == "inner"
@@ -800,7 +951,6 @@ class TestContextStack:
         _context_stack.pop()
 
     def test_thread_isolation(self) -> None:
-        from capsera._context import _context_stack
         results: dict[str, Any] = {}
 
         def thread_fn(name: str) -> None:

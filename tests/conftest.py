@@ -4,17 +4,13 @@ Shared pytest fixtures for the Capsera SDK test suite.
 from __future__ import annotations
 
 import threading
-import time
-from decimal import Decimal
-from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from capsera._config import Config
 from capsera._emitter import Emitter
 from capsera._models import TokenEvent
-
 
 # --------------------------------------------------------------------------- #
 # Config fixtures
@@ -37,7 +33,7 @@ def base_config() -> Config:
 # --------------------------------------------------------------------------- #
 
 @pytest.fixture
-def capturing_emitter(base_config: Config) -> "CapturingEmitter":
+def capturing_emitter(base_config: Config) -> CapturingEmitter:
     """
     An Emitter subclass that captures events in memory rather than sending them
     over HTTP.  Use ``captured`` to inspect what was enqueued.

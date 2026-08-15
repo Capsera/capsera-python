@@ -17,7 +17,6 @@ import pytest
 import capsera
 from capsera._config import Config
 from capsera._interceptor import Interceptor
-from capsera._models import TokenEvent
 
 from .conftest import CapturingEmitter
 

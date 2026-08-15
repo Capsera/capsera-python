@@ -17,7 +17,6 @@ import pytest
 
 from capsera._config import Config
 from capsera._interceptor import Interceptor
-
 from tests.conftest import CapturingEmitter
 
 

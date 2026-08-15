@@ -14,9 +14,8 @@ import pytest
 from capsera._config import Config
 from capsera._interceptor import Interceptor
 
-from .conftest import CapturingEmitter, make_openai_response
+from .conftest import CapturingEmitter, make_anthropic_response, make_openai_response
 from .test_interceptor import _make_fake_anthropic_module, _make_fake_openai_module
-from .conftest import make_anthropic_response
 
 
 @pytest.fixture

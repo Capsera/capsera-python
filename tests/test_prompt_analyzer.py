@@ -4,8 +4,6 @@ from __future__ import annotations
 import hashlib
 from unittest.mock import MagicMock
 
-import pytest
-
 from capsera._config import Config
 from capsera._models import PromptMetadata
 from capsera._prompt_analyzer import PromptAnalyzer, _get_context_window

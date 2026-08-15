@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from typing import Optional
 
 import pytest
 
@@ -59,7 +58,7 @@ class TestContextStack:
 
     def test_thread_isolation(self) -> None:
         """Each thread sees its own stack."""
-        seen: dict[str, Optional[str]] = {}
+        seen: dict[str, str | None] = {}
 
         def worker(name: str) -> None:
             self._stack.push(AgentContext(agent=name))
@@ -81,7 +80,7 @@ class TestAgentDecorator:
     """Tests for @capsera.agent()."""
 
     def test_sync_function_tagged(self) -> None:
-        captured: list[Optional[str]] = []
+        captured: list[str | None] = []
 
         @capsera.agent(name="dec_agent", team="dec_team", task_type="dec_task")
         def my_func() -> None:
@@ -117,7 +116,7 @@ class TestAgentDecorator:
         assert ctx is None or ctx.agent != "boom_agent"
 
     def test_async_function_tagged(self) -> None:
-        captured: list[Optional[str]] = []
+        captured: list[str | None] = []
 
         @capsera.agent(name="async_agent")
         async def my_async_func() -> None:

@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 
@@ -19,7 +19,7 @@ from . import _catalog
 from ._config import Config
 from ._context import AgentContext
 from ._models import RoutingDecision
-from ._pricing import PRICING, get_pricing
+from ._pricing import get_pricing
 from ._version import __version__
 
 logger = logging.getLogger("capsera")
@@ -63,6 +63,42 @@ def _model_cost_per_1k(model: str) -> float:
     return float(pricing.input_per_1k + pricing.output_per_1k)
 
 
+# --------------------------------------------------------------------------- #
+# Backend payload conversion
+#
+# Shared by the sync in-process fetch (Router._fetch_*) and the LiteLLM proxy's
+# async refresh, so the wire shape of /v1/routing/rules and
+# /v1/routing/budget-status is parsed in exactly one place.
+# --------------------------------------------------------------------------- #
+
+def convert_backend_rules(raw_rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten backend RoutingRule rows into the engine's rule dicts.
+
+    Drops disabled rules and merges each row's ``config_json`` up to the top
+    level beside ``type``/``name``/``priority``.
+    """
+    converted: list[dict[str, Any]] = []
+    for r in raw_rules or []:
+        if not r.get("enabled", True):
+            continue
+        cfg = r.get("config_json", {}) or {}
+        converted.append({
+            "type": r.get("rule_type", ""),
+            "name": r.get("name", ""),
+            "priority": r.get("priority", 0),
+            **cfg,
+        })
+    return converted
+
+
+def convert_budget_status(budgets: list[dict[str, Any]]) -> dict[str, float]:
+    """Map /v1/routing/budget-status rows to ``{budget_id: pct_used}``."""
+    cache: dict[str, float] = {}
+    for b in budgets or []:
+        cache[b.get("budget_id", "")] = b.get("pct_used", 0.0)
+    return cache
+
+
 # ------------------------------------------------------------------ #
 # Parsed rule types
 # ------------------------------------------------------------------ #
@@ -80,8 +116,8 @@ class _ModelMapRule:
     name: str
     from_model: str
     target_model: str
-    scope_agent: Optional[str] = None
-    scope_team: Optional[str] = None
+    scope_agent: str | None = None
+    scope_team: str | None = None
     priority: int = 0
 
 
@@ -140,10 +176,22 @@ class Router:
     def evaluate(
         self,
         kwargs: dict[str, Any],
-        context: Optional[AgentContext],
+        context: AgentContext | None,
+        *,
+        refresh: bool = True,
     ) -> RoutingDecision:
+        """Evaluate routing rules against a call.
+
+        ``refresh=True`` (default) pulls fresh rules/budget-status from the
+        backend via the Router's own **sync** client when stale — correct for
+        the in-process SDK path. Callers that drive refresh themselves (the
+        LiteLLM proxy refreshes asynchronously so it never blocks the event
+        loop) pass ``refresh=False`` and this becomes pure, non-blocking rule
+        evaluation against whatever rules/budget are currently loaded.
+        """
         try:
-            self._refresh_if_stale()
+            if refresh:
+                self._refresh_if_stale()
             return self._evaluate_rules(kwargs, context)
         except Exception:
             logger.debug("capsera: routing evaluation failed — passing through", exc_info=True)
@@ -176,23 +224,13 @@ class Router:
         try:
             resp = self._client.get("/v1/routing/rules")
             if resp.status_code == 200:
-                backend_rules = resp.json()
-                converted = []
-                for r in backend_rules:
-                    if not r.get("enabled", True):
-                        continue
-                    cfg = r.get("config_json", {})
-                    rule = {
-                        "type": r.get("rule_type", ""),
-                        "name": r.get("name", ""),
-                        "priority": r.get("priority", 0),
-                        **cfg,
-                    }
-                    converted.append(rule)
-                self._backend_rules = converted
+                self._backend_rules = convert_backend_rules(resp.json())
                 self._rebuild_effective_rules()
                 if self._config.debug:
-                    logger.debug("capsera: fetched %d routing rules from backend", len(converted))
+                    logger.debug(
+                        "capsera: fetched %d routing rules from backend",
+                        len(self._backend_rules),
+                    )
         except Exception:
             logger.debug("capsera: failed to fetch routing rules from backend", exc_info=True)
 
@@ -200,13 +238,9 @@ class Router:
         try:
             resp = self._client.get("/v1/routing/budget-status")
             if resp.status_code == 200:
-                budgets = resp.json()
-                cache: dict[str, float] = {}
-                for b in budgets:
-                    cache[b.get("budget_id", "")] = b.get("pct_used", 0.0)
-                self._budget_cache = cache
+                self._budget_cache = convert_budget_status(resp.json())
                 if self._config.debug:
-                    logger.debug("capsera: refreshed budget cache (%d budgets)", len(cache))
+                    logger.debug("capsera: refreshed budget cache (%d budgets)", len(self._budget_cache))
         except Exception:
             logger.debug("capsera: failed to fetch budget status from backend", exc_info=True)
 
@@ -226,7 +260,7 @@ class Router:
     def _evaluate_rules(
         self,
         kwargs: dict[str, Any],
-        context: Optional[AgentContext],
+        context: AgentContext | None,
     ) -> RoutingDecision:
         current_model = kwargs.get("model", "")
         if not current_model:
@@ -263,7 +297,7 @@ class Router:
     def _check_cost_cap(
         self,
         current_model: str,
-        task_type: Optional[str],
+        task_type: str | None,
         critical_types: set[str],
     ) -> RoutingDecision:
         if task_type and task_type in critical_types:
@@ -291,7 +325,7 @@ class Router:
     def _check_task_type(
         self,
         current_model: str,
-        task_type: Optional[str],
+        task_type: str | None,
     ) -> RoutingDecision:
         if not task_type:
             return RoutingDecision()
@@ -314,8 +348,8 @@ class Router:
     def _check_model_map(
         self,
         current_model: str,
-        agent_id: Optional[str],
-        team_id: Optional[str],
+        agent_id: str | None,
+        team_id: str | None,
     ) -> RoutingDecision:
         for rule in self._model_map_rules:
             if rule.from_model != current_model:

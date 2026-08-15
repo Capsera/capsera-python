@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import functools
 import inspect
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 from ._context import AgentContext, _context_stack
 
@@ -16,11 +17,11 @@ from ._context import AgentContext, _context_stack
 def _context(
     *,
     agent: str,
-    team: Optional[str] = None,
-    task_type: Optional[str] = None,
-    session_id: Optional[str] = None,
-    customer_id: Optional[str] = None,
-    cost_center: Optional[str] = None,
+    team: str | None = None,
+    task_type: str | None = None,
+    session_id: str | None = None,
+    customer_id: str | None = None,
+    cost_center: str | None = None,
 ) -> AgentContext:
     return AgentContext(
         agent=agent,
@@ -35,10 +36,10 @@ def _context(
 def framework_unit(
     *,
     agent: str,
-    team: Optional[str] = None,
-    task_type: Optional[str] = None,
-    customer_id: Optional[str] = None,
-    cost_center: Optional[str] = None,
+    team: str | None = None,
+    task_type: str | None = None,
+    customer_id: str | None = None,
+    cost_center: str | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorate a framework node/task so LLM calls inside it are attributed."""
 
@@ -78,10 +79,10 @@ def framework_unit(
 def langgraph_node(
     name: str,
     *,
-    team: Optional[str] = None,
-    task_type: Optional[str] = None,
-    customer_id: Optional[str] = None,
-    cost_center: Optional[str] = None,
+    team: str | None = None,
+    task_type: str | None = None,
+    customer_id: str | None = None,
+    cost_center: str | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator for LangGraph node functions."""
 
@@ -97,10 +98,10 @@ def langgraph_node(
 def crewai_agent(
     name: str,
     *,
-    team: Optional[str] = None,
-    task_type: Optional[str] = None,
-    customer_id: Optional[str] = None,
-    cost_center: Optional[str] = None,
+    team: str | None = None,
+    task_type: str | None = None,
+    customer_id: str | None = None,
+    cost_center: str | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator for CrewAI agent entrypoints."""
 
@@ -116,9 +117,9 @@ def crewai_agent(
 def crewai_task(
     name: str,
     *,
-    team: Optional[str] = None,
-    customer_id: Optional[str] = None,
-    cost_center: Optional[str] = None,
+    team: str | None = None,
+    customer_id: str | None = None,
+    cost_center: str | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator for CrewAI task functions."""
 
@@ -128,6 +129,94 @@ def crewai_task(
         task_type="crewai_task",
         customer_id=customer_id,
         cost_center=cost_center,
+    )
+
+
+class _AttributedChatClient:
+    """Duck-typed proxy around an AutoGen ``ChatCompletionClient``.
+
+    Pushes the agent's context for exactly the span of each ``create`` /
+    ``create_stream`` call and passes every other attribute straight through,
+    so one shared underlying client (or factory-built clients) can serve many
+    agents while each agent's completions are attributed to its own name.
+    Deliberately not a ``ChatCompletionClient`` subclass: autogen stays an
+    optional dependency, and the ABC's abstract surface differs across
+    versions — duck typing tracks the real contract (AssistantAgent only ever
+    calls methods on the client, it never isinstance-checks it).
+    """
+
+    def __init__(self, inner: Any, ctx: AgentContext) -> None:
+        self._capsera_inner = inner
+        self._capsera_ctx = ctx
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._capsera_inner, item)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging nicety
+        return f"AutogenAgentClient({self._capsera_inner!r})"
+
+    async def create(self, *args: Any, **kwargs: Any) -> Any:
+        _context_stack.push(self._capsera_ctx)
+        try:
+            result = self._capsera_inner.create(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        finally:
+            _context_stack.pop()
+
+    async def create_stream(self, *args: Any, **kwargs: Any) -> Any:
+        # Async generator: the context must span the whole iteration, not just
+        # the call that constructs the stream — the provider request happens
+        # while the caller iterates. The ``finally`` pop also runs when the
+        # consumer abandons the stream (aclose/GC), and pop() on an already-
+        # unwound stack is a safe no-op.
+        _context_stack.push(self._capsera_ctx)
+        try:
+            stream = self._capsera_inner.create_stream(*args, **kwargs)
+            if inspect.isawaitable(stream):
+                stream = await stream
+            async for item in stream:
+                yield item
+        finally:
+            _context_stack.pop()
+
+
+def autogen_agent(
+    model_client: Any,
+    *,
+    name: str,
+    team: str | None = None,
+    task_type: str | None = None,
+    customer_id: str | None = None,
+    cost_center: str | None = None,
+) -> Any:
+    """Wrap an AutoGen ``ChatCompletionClient`` so its completions are
+    attributed to ``name``.
+
+    AutoGen agents (``AssistantAgent`` et al.) are declared as objects, not
+    functions, so there is nothing to decorate — attribution instead rides the
+    model client each agent owns::
+
+        planner = AssistantAgent(
+            name="planner",
+            model_client=capsera.autogen_agent(build_client(), name="planner"),
+        )
+
+    Context isolation is ``contextvars``-based, so concurrently-running agents
+    on one event loop each keep their own attribution. The wrapper is inert
+    when ``capsera.init()`` was never called — exactly like the decorators.
+    """
+
+    return _AttributedChatClient(
+        model_client,
+        _context(
+            agent=name,
+            team=team,
+            task_type=task_type,
+            customer_id=customer_id,
+            cost_center=cost_center,
+        ),
     )
 
 
@@ -144,11 +233,11 @@ class LangChainCapseraCallback:
         self,
         *,
         agent: str,
-        team: Optional[str] = None,
-        task_type: Optional[str] = "langchain",
-        session_id: Optional[str] = None,
-        customer_id: Optional[str] = None,
-        cost_center: Optional[str] = None,
+        team: str | None = None,
+        task_type: str | None = "langchain",
+        session_id: str | None = None,
+        customer_id: str | None = None,
+        cost_center: str | None = None,
     ) -> None:
         self._ctx = _context(
             agent=agent,

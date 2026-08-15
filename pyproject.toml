@@ -51,9 +51,13 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-mock>=3.12",
-    "ruff>=0.4",
+    "ruff==0.16.2",
     "mypy>=1.9",
     "jsonschema>=4.21",
+    # tests/validation import the backend's Pydantic ingest schema
+    # (app.schemas.event) to assert the SDK's events satisfy the contract.
+    # Kept in lockstep with backend/requirements.txt's pydantic major.
+    "pydantic>=2.9,<3",
 ]
 # Real provider client libraries — used by the contract layer (tests/contract,
 # real clients against a local mock server) and the live smoke suite
@@ -66,6 +70,12 @@ test-providers = [
     "mistralai>=1.2",
     "cohere>=5.13",
     "boto3>=1.39",          # >=1.39 for AWS_BEARER_TOKEN_BEDROCK support
+]
+# AI gateway client libraries — used to validate the gateway integrations
+# (capsera/gateways/) against the real packages. Never runtime deps.
+test-gateways = [
+    "litellm>=1.50",
+    "portkey-ai>=1.10",
 ]
 # AI frameworks the interceptor must survive — used by framework contract
 # tests and the evals corpus (langchain/langgraph pins match evals/generator.py).

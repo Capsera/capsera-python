@@ -40,6 +40,8 @@ attributed to `unknown`.
 | OpenAI embeddings | sync, async, errors |
 | Google Gemini (`google-genai`, `google-generativeai`) | sync (plus async on the legacy client), errors |
 | Mistral, Cohere, Vertex AI, AWS Bedrock | sync, errors |
+| LiteLLM (SDK + proxy) | sync, async, streaming, embeddings, errors — with LiteLLM's own cost figure |
+| Portkey (`portkey_ai`) | chat + embeddings, sync, async, errors |
 
 Frameworks need no separate integration: they call the provider clients above,
 so their calls are captured by construction. Where Capsera does extra work is
@@ -50,6 +52,26 @@ LlamaIndex, AutoGen, Haystack, DSPy and the LiteLLM gateway.
 Each captured call records token counts, cost from a maintained pricing catalog,
 latency, the agent/team/session it belongs to, and the file and line that made
 it.
+
+## AI gateways
+
+Keep your gateway — Capsera governs the spend that flows through it. Calls
+made through **LiteLLM** or **Portkey** are captured automatically (with
+budget enforcement before dispatch, and no double counting against the inner
+provider SDKs). OpenAI-compatible gateways addressed by `base_url` —
+**Bifrost, OpenRouter, Helicone, Cloudflare AI Gateway**, a self-hosted
+LiteLLM proxy — are detected from the host and tagged on every event
+(`gateway="openrouter"`, ...). Self-hosted gateways on unrecognisable hosts:
+`capsera.init(gateway="bifrost")`.
+
+Running a LiteLLM **proxy**? A drop-in handler adds org-level capture and hard
+pre-call budget blocking at the gateway itself:
+
+```yaml
+# proxy config.yaml   (pip install capsera; set CAPSERA_API_KEY)
+litellm_settings:
+  callbacks: ["capsera.gateways.litellm_proxy.capsera_handler"]
+```
 
 ## Design guarantees
 
@@ -101,8 +123,13 @@ use is being tracked.
 
 Requires Python 3.11+. The only runtime dependency is `httpx`.
 
+Every function, decorator, type and gateway entry point — with full signatures,
+defaults and failure behavior — is in the
+[API reference](../docs/sdk-api-reference.md).
+
 ## Links
 
+- [API reference](../docs/sdk-api-reference.md)
 - [Capsera](https://capsera.ai)
 - [Dashboard](https://app.capsera.ai)
 

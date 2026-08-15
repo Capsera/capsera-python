@@ -9,9 +9,9 @@ Last updated: 2026-04-19
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import sys
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -304,6 +304,49 @@ _UNKNOWN_PRICING = ModelPricing(
 # Bedrock cross-region inference profiles prefix model IDs with a geo scope.
 _BEDROCK_PROFILE_SCOPES = ("us.", "eu.", "apac.", "global.", "us-gov.", "jp.", "au.")
 
+_THOUSAND = Decimal("1000")
+
+
+def _external_pricing(model: str) -> ModelPricing | None:
+    """Fallback pricing from a maintained public source, for models absent from
+    Capsera's own table.
+
+    Reads LiteLLM's ``model_cost`` map (loaded from its published
+    ``model_prices_and_context_window.json``, refreshed every litellm release)
+    — but **only when litellm is ALREADY imported** in this process. We never
+    import it ourselves: litellm is heavy and optional, so this is free where
+    the customer already uses it (SDK/proxy processes) and a silent no-op
+    everywhere else (e.g. the backend). LiteLLM quotes per-token USD; we convert
+    to Capsera's per-1k convention. Returns None when the source is unavailable
+    or has no entry, so the caller proceeds to the generic estimate.
+    """
+    litellm = sys.modules.get("litellm")
+    cost_map = getattr(litellm, "model_cost", None) if litellm is not None else None
+    if not isinstance(cost_map, dict):
+        return None
+
+    # Local import avoids a cycle at module load (_catalog imports nothing from _pricing).
+    from ._catalog import strip_vendor_prefix
+
+    for key in (model, strip_vendor_prefix(model)):
+        entry = cost_map.get(key)
+        if not isinstance(entry, dict):
+            continue
+        in_c = entry.get("input_cost_per_token")
+        out_c = entry.get("output_cost_per_token")
+        if in_c is None and out_c is None:
+            continue
+        try:
+            return ModelPricing(
+                input_per_1k=Decimal(str(in_c or 0)) * _THOUSAND,
+                output_per_1k=Decimal(str(out_c or 0)) * _THOUSAND,
+                cache_read_per_1k=Decimal(str(entry.get("cache_read_input_token_cost") or 0)) * _THOUSAND,
+                cache_write_per_1k=Decimal(str(entry.get("cache_creation_input_token_cost") or 0)) * _THOUSAND,
+            )
+        except (ValueError, ArithmeticError):
+            return None
+    return None
+
 
 def get_pricing(model: str) -> ModelPricing:
     """
@@ -313,14 +356,24 @@ def get_pricing(model: str) -> ModelPricing:
     1. Exact match
     2. Exact match with Bedrock regional inference-profile scope stripped
        (e.g. "apac.amazon.nova-micro-v1:0" → "amazon.nova-micro-v1:0")
-    3. Prefix match (e.g. "claude-sonnet-4-6-..." → "claude-sonnet-4-6")
-    4. Fallback to a generic $0.001 / $0.003 estimate and log a warning
+    3. Exact match with gateway vendor prefixes stripped
+       (e.g. "anthropic/claude-sonnet-4-6" via LiteLLM/OpenRouter/Portkey
+       → "claude-sonnet-4-6") — after exact lookups so real slash-keyed rows
+       (Together "meta-llama/...", Fireworks "accounts/...") always win first
+    4. Prefix match (e.g. "claude-sonnet-4-6-..." → "claude-sonnet-4-6")
+    5. Fallback to a generic $0.001 / $0.003 estimate and log a warning
     """
+    # Local import: _catalog does not import _pricing, so this is cycle-free.
+    from ._catalog import strip_vendor_prefix
+
     candidates = [model]
     for scope in _BEDROCK_PROFILE_SCOPES:
         if model.startswith(scope):
             candidates.append(model[len(scope):])
             break
+    stripped = strip_vendor_prefix(model)
+    if stripped != model:
+        candidates.append(stripped)
 
     for candidate in candidates:
         if candidate in PRICING:
@@ -331,6 +384,12 @@ def get_pricing(model: str) -> ModelPricing:
         for key in PRICING:
             if candidate.startswith(key):
                 return PRICING[key]
+
+    # Maintained public source (litellm's table, if already loaded) beats a
+    # blind $0.001/$0.003 guess for models we simply don't carry yet.
+    external = _external_pricing(model)
+    if external is not None:
+        return external
 
     import logging
     logging.getLogger("capsera").warning(

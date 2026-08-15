@@ -245,10 +245,10 @@ class TestFrameworkDetection:
     """Tests for dynamic framework detection in _SKIP_FRAME_FRAGMENTS."""
 
     def test_detect_frameworks_adds_installed_packages(self) -> None:
-        from capsera._interceptor import _detect_frameworks, _SKIP_FRAME_FRAGMENTS_BASE
-
         # Reset the initialized flag for testing
         import importlib
+
+        from capsera._interceptor import _detect_frameworks
         _mod = importlib.import_module("capsera._interceptor")
         _mod._skip_fragments_initialized = False
 
@@ -262,9 +262,9 @@ class TestFrameworkDetection:
         _mod._skip_fragments_initialized = False
 
     def test_detect_frameworks_is_idempotent(self) -> None:
-        from capsera._interceptor import _detect_frameworks
-
         import importlib
+
+        from capsera._interceptor import _detect_frameworks
         _mod = importlib.import_module("capsera._interceptor")
         _mod._skip_fragments_initialized = False
 
@@ -272,4 +272,21 @@ class TestFrameworkDetection:
         result2 = _detect_frameworks()
 
         assert result1 == result2
+        _mod._skip_fragments_initialized = False
+
+    def test_autogen_04_detected_without_top_level_autogen_module(self, monkeypatch) -> None:
+        # AutoGen 0.4+ ships as autogen_agentchat/autogen_core/autogen_ext with
+        # NO top-level `autogen` module, so detection must fire off autogen_core
+        # (the base dependency every 0.4 layout shares).
+        import importlib
+        import sys
+        import types
+
+        _mod = importlib.import_module("capsera._interceptor")
+        monkeypatch.setitem(sys.modules, "autogen_core", types.ModuleType("autogen_core"))
+        _mod._skip_fragments_initialized = False
+
+        fragments = _mod._detect_frameworks()
+
+        assert "site-packages/autogen" in fragments
         _mod._skip_fragments_initialized = False

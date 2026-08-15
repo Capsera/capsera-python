@@ -4,7 +4,6 @@ TokenEvent with is_error=True and re-raise the original exception.
 """
 from __future__ import annotations
 
-import sys
 from types import ModuleType
 from typing import Any
 

@@ -8,7 +8,7 @@ easy to serialise, copy, and test without any heavy dependencies.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 
 class BudgetExceededError(RuntimeError):
@@ -21,6 +21,7 @@ class BudgetExceededError(RuntimeError):
 _CONTRACT_MAX_LEN = {
     "model": 64,
     "provider": 64,
+    "gateway": 64,
     "original_model": 64,
     "system_prompt_hash": 64,
     "agent_id": 128,
@@ -79,27 +80,31 @@ class TokenEvent:
     # Attribution (populated from context stack / config)
     agent_id: str = "unknown"
     env: str = "development"
-    team_id: Optional[str] = None
-    task_type: Optional[str] = None
-    session_id: Optional[str] = None
-    user_id: Optional[str] = None
-    customer_id: Optional[str] = None
-    cost_center: Optional[str] = None
+    team_id: str | None = None
+    task_type: str | None = None
+    session_id: str | None = None
+    user_id: str | None = None
+    customer_id: str | None = None
+    cost_center: str | None = None
 
     # Request metadata
     latency_ms: int = 0
-    caller_file: Optional[str] = None
+    caller_file: str | None = None
+    # AI gateway the call rode through, when one was detected or declared
+    # ("litellm" | "portkey" | "openrouter" | "bifrost" | "helicone" | ...).
+    # None for direct provider calls. Orthogonal to ``provider``.
+    gateway: str | None = None
 
     # Routing
     was_routed: bool = False
-    original_model: Optional[str] = None
+    original_model: str | None = None
 
     # Error capture — set when the provider call raised instead of returning.
     is_error: bool = False
-    error_type: Optional[str] = None
+    error_type: str | None = None
 
     # Prompt analysis (opt-in)
-    system_prompt_hash: Optional[str] = None
+    system_prompt_hash: str | None = None
     system_prompt_tokens: int = 0
     message_count: int = 0
     conversation_tokens: int = 0
@@ -156,7 +161,7 @@ class TokenEvent:
 class PromptMetadata:
     """Structural metadata extracted from a prompt — never contains content."""
 
-    system_prompt_hash: Optional[str] = None
+    system_prompt_hash: str | None = None
     system_prompt_tokens: int = 0
     message_count: int = 0
     conversation_tokens: int = 0
@@ -172,7 +177,7 @@ class RoutingDecision:
     """Result of evaluating routing rules against an LLM call."""
 
     routed: bool = False
-    target_model: Optional[str] = None
-    original_model: Optional[str] = None
-    rule_name: Optional[str] = None
-    rule_type: Optional[str] = None
+    target_model: str | None = None
+    original_model: str | None = None
+    rule_name: str | None = None
+    rule_type: str | None = None

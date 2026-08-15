@@ -4,8 +4,8 @@ import logging
 import queue
 import threading
 import time
-from datetime import datetime, timezone
-from typing import Callable, List
+from collections.abc import Callable
+from datetime import UTC, datetime
 
 import httpx
 
@@ -91,7 +91,7 @@ class Emitter:
 
     def enqueue(self, event: TokenEvent) -> None:
         if self._limit_reached:
-            now = datetime.now(timezone.utc).strftime("%Y-%m")
+            now = datetime.now(UTC).strftime("%Y-%m")
             if self._limit_resets_at and now <= self._limit_resets_at:
                 logger.debug("capsera: event dropped — monthly limit reached (resets %s)", self._limit_resets_at)
                 return
@@ -163,7 +163,7 @@ class Emitter:
                 if self._config.debug:
                     logger.exception("capsera: unexpected error in emitter worker")
 
-    def _send(self, events: List[TokenEvent]) -> None:
+    def _send(self, events: list[TokenEvent]) -> None:
         payload = {"events": [e.to_dict() for e in events]}
         delays = [1, 2, 4]
         was_circuit_open = self._consecutive_failures >= self._FAILURE_THRESHOLD

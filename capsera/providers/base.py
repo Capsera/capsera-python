@@ -10,8 +10,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from .._models import TokenEvent
-
 
 class ProviderParser(ABC):
     """Extract token counts and model information from a raw API response."""

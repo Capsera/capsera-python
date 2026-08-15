@@ -18,25 +18,24 @@ from __future__ import annotations
 
 import contextvars
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
 class AgentContext:
     """Carries attribution metadata for a single logical scope."""
 
-    agent: Optional[str] = None
-    team: Optional[str] = None
-    task_type: Optional[str] = None
-    session_id: Optional[str] = None
-    customer_id: Optional[str] = None
-    cost_center: Optional[str] = None
+    agent: str | None = None
+    team: str | None = None
+    task_type: str | None = None
+    session_id: str | None = None
+    customer_id: str | None = None
+    cost_center: str | None = None
 
 
 _stack_var: contextvars.ContextVar[tuple[AgentContext, ...]] = contextvars.ContextVar(
     "capsera_context_stack", default=()
 )
-_session_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+_session_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "capsera_session_id", default=None
 )
 
@@ -57,7 +56,7 @@ class ContextStack:
         if stack:
             _stack_var.set(stack[:-1])
 
-    def current(self) -> Optional[AgentContext]:
+    def current(self) -> AgentContext | None:
         """Return the innermost context, or None if the stack is empty."""
         stack = _stack_var.get()
         return stack[-1] if stack else None
@@ -65,12 +64,12 @@ class ContextStack:
     def depth(self) -> int:
         return len(_stack_var.get())
 
-    def set_session(self, session_id: Optional[str]) -> None:
+    def set_session(self, session_id: str | None) -> None:
         """Set a request-level session_id that applies to all calls in this
         thread (and, in async servers, this task)."""
         _session_var.set(session_id)
 
-    def get_session(self) -> Optional[str]:
+    def get_session(self) -> str | None:
         """Get the ambient session_id, if set."""
         return _session_var.get()
 

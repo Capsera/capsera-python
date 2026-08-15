@@ -5,11 +5,8 @@ from __future__ import annotations
 
 import copy
 
-import pytest
-
 from capsera._config import Config
 from capsera._context import AgentContext
-from capsera._models import RoutingDecision
 from capsera._router import Router, _infer_provider, _same_provider
 
 
@@ -387,6 +384,85 @@ class TestEmptyModel:
         ctx = AgentContext(task_type="classification")
         decision = router.evaluate({}, ctx)
         assert decision.routed is False
+
+
+class TestEvaluateRefreshFlag:
+    """refresh=False (the LiteLLM-proxy path) must never touch the network —
+    it evaluates purely against whatever rules/budget are already loaded."""
+
+    def test_refresh_false_skips_backend_fetch(self, monkeypatch) -> None:
+        cfg = _cfg(routing_rules=[
+            {"type": "model_map", "from_model": "gpt-4o", "target_model": "gpt-4o-mini"},
+        ])
+        router = Router(cfg)
+
+        called = {"n": 0}
+
+        def _boom() -> None:
+            called["n"] += 1
+            raise AssertionError("refresh=False must not refresh")
+
+        monkeypatch.setattr(router, "_refresh_if_stale", _boom)
+        decision = router.evaluate({"model": "gpt-4o"}, None, refresh=False)
+        assert called["n"] == 0
+        assert decision.routed is True
+        assert decision.target_model == "gpt-4o-mini"
+
+    def test_refresh_true_still_refreshes(self, monkeypatch) -> None:
+        cfg = _cfg(routing_rules=[])
+        router = Router(cfg)
+        called = {"n": 0}
+        monkeypatch.setattr(router, "_refresh_if_stale", lambda: called.__setitem__("n", called["n"] + 1))
+        router.evaluate({"model": "gpt-4o"}, None)
+        assert called["n"] == 1
+
+
+class TestBackendPayloadConversion:
+    def test_convert_backend_rules_flattens_and_drops_disabled(self) -> None:
+        from capsera._router import convert_backend_rules
+
+        rows = [
+            {
+                "rule_type": "model_map",
+                "name": "downgrade",
+                "priority": 3,
+                "enabled": True,
+                "config_json": {"from_model": "gpt-4o", "target_model": "gpt-4o-mini"},
+            },
+            {
+                "rule_type": "task_type",
+                "name": "off",
+                "enabled": False,
+                "config_json": {"match": "x", "target_model": "y"},
+            },
+        ]
+        out = convert_backend_rules(rows)
+        assert out == [
+            {
+                "type": "model_map",
+                "name": "downgrade",
+                "priority": 3,
+                "from_model": "gpt-4o",
+                "target_model": "gpt-4o-mini",
+            }
+        ]
+
+    def test_convert_backend_rules_tolerates_none_and_missing(self) -> None:
+        from capsera._router import convert_backend_rules
+
+        assert convert_backend_rules(None) == []
+        out = convert_backend_rules([{"rule_type": "cost_cap"}])
+        assert out == [{"type": "cost_cap", "name": "", "priority": 0}]
+
+    def test_convert_budget_status_maps_pct(self) -> None:
+        from capsera._router import convert_budget_status
+
+        rows = [
+            {"budget_id": "b1", "pct_used": 0.42},
+            {"budget_id": "b2", "pct_used": 1.1},
+        ]
+        assert convert_budget_status(rows) == {"b1": 0.42, "b2": 1.1}
+        assert convert_budget_status(None) == {}
 
 
 class TestUnknownRuleType:

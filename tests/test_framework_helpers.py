@@ -87,3 +87,86 @@ def test_langchain_callback_error_pops_context() -> None:
     callback.on_llm_start({}, ["hello"])
     callback.on_llm_error(RuntimeError("boom"))
     assert _context_stack.current() is None
+
+
+class _FakeChatClient:
+    """Stands in for an AutoGen ChatCompletionClient (duck-typed)."""
+
+    def __init__(self) -> None:
+        self.seen_contexts: list = []
+        self.model_info = {"family": "fake", "vision": False}
+
+    async def create(self, messages, **kwargs):
+        self.seen_contexts.append(_context_stack.current())
+        return {"content": "ok", "messages": messages}
+
+    async def create_stream(self, messages, **kwargs):
+        for chunk in ("a", "b"):
+            self.seen_contexts.append(_context_stack.current())
+            yield chunk
+
+    def count_tokens(self, messages) -> int:
+        return 7
+
+
+def test_autogen_agent_attributes_create_calls() -> None:
+    inner = _FakeChatClient()
+    client = capsera.autogen_agent(
+        inner, name="planner", team="bi", task_type="planning"
+    )
+
+    result = asyncio.run(client.create([{"role": "user", "content": "hi"}]))
+    assert result["content"] == "ok"
+    ctx = inner.seen_contexts[0]
+    assert ctx.agent == "planner"
+    assert ctx.team == "bi"
+    assert ctx.task_type == "planning"
+    assert _context_stack.current() is None
+
+
+def test_autogen_agent_attributes_whole_stream() -> None:
+    inner = _FakeChatClient()
+    client = capsera.autogen_agent(inner, name="analyst")
+
+    async def consume():
+        return [chunk async for chunk in client.create_stream([])]
+
+    assert asyncio.run(consume()) == ["a", "b"]
+    assert [c.agent for c in inner.seen_contexts] == ["analyst", "analyst"]
+    assert _context_stack.current() is None
+
+
+def test_autogen_agent_pops_context_on_error() -> None:
+    class _Boom:
+        async def create(self, messages):
+            raise RuntimeError("provider down")
+
+    client = capsera.autogen_agent(_Boom(), name="critic")
+    try:
+        asyncio.run(client.create([]))
+    except RuntimeError:
+        pass
+    assert _context_stack.current() is None
+
+
+def test_autogen_agent_passes_other_attributes_through() -> None:
+    inner = _FakeChatClient()
+    client = capsera.autogen_agent(inner, name="chart-writer")
+    assert client.count_tokens([]) == 7
+    assert client.model_info == {"family": "fake", "vision": False}
+
+
+def test_autogen_agent_isolates_concurrent_agents() -> None:
+    # Two agents sharing one event loop must never steal each other's
+    # attribution — the contextvars-based stack keeps each task's pushes
+    # invisible to its sibling.
+    inner_a, inner_b = _FakeChatClient(), _FakeChatClient()
+    a = capsera.autogen_agent(inner_a, name="agent-a")
+    b = capsera.autogen_agent(inner_b, name="agent-b")
+
+    async def run_both():
+        await asyncio.gather(a.create([]), b.create([]))
+
+    asyncio.run(run_both())
+    assert inner_a.seen_contexts[0].agent == "agent-a"
+    assert inner_b.seen_contexts[0].agent == "agent-b"

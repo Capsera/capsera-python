@@ -37,18 +37,17 @@ Quickstart
 """
 from __future__ import annotations
 
-import asyncio
 import functools
 import inspect
 import logging
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Callable, Generator, Optional
+from typing import Any
 from uuid import uuid4
 
 from ._config import Config, _global_config
-from ._version import __version__
 from ._context import AgentContext, _context_stack
 from ._emitter import Emitter
 from ._interceptor import Interceptor, _reset_budget_clients, get_interception_report
@@ -56,8 +55,10 @@ from ._models import BudgetExceededError, TokenEvent
 from ._pricing import compute_cost
 from ._prompt_analyzer import PromptAnalyzer
 from ._router import Router
+from ._version import __version__
 from .frameworks import (
     LangChainCapseraCallback,
+    autogen_agent,
     crewai_agent,
     crewai_task,
     framework_unit,
@@ -81,6 +82,7 @@ __all__ = [
     "langgraph_node",
     "crewai_agent",
     "crewai_task",
+    "autogen_agent",
     "LangChainCapseraCallback",
     # Re-export types that users may want to type-hint against
     "Config",
@@ -92,10 +94,10 @@ __all__ = [
 logger = logging.getLogger("capsera")
 
 # Module-level singletons — set by init()
-_emitter: Optional[Emitter] = None
-_interceptor: Optional[Interceptor] = None
-_router: Optional[Router] = None
-_analyzer: Optional[PromptAnalyzer] = None
+_emitter: Emitter | None = None
+_interceptor: Interceptor | None = None
+_router: Router | None = None
+_analyzer: PromptAnalyzer | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -105,22 +107,23 @@ _analyzer: Optional[PromptAnalyzer] = None
 def init(
     api_key: str = "dev",
     endpoint: str = "http://localhost:8000",
-    agent_name: Optional[str] = None,
-    team: Optional[str] = None,
+    agent_name: str | None = None,
+    team: str | None = None,
+    gateway: str | None = None,
     env: str = "development",
     flush_interval_ms: int = 500,
     enable_routing: bool = False,
-    routing_rules: Optional[list[dict[str, Any]]] = None,
+    routing_rules: list[dict[str, Any]] | None = None,
     routing_refresh_interval: int = 60,
-    critical_task_types: Optional[list[str]] = None,
+    critical_task_types: list[str] | None = None,
     enable_budget_enforcement: bool = True,
     budget_check_timeout: float = 1.0,
     enable_prompt_analysis: bool = False,
     prompt_size_threshold: int = 4000,
-    on_oversized_prompt: Optional[Callable[[int, int], None]] = None,
+    on_oversized_prompt: Callable[[int, int], None] | None = None,
     debug: bool = False,
     max_retries: int = 3,
-    on_error: Optional[callable] = None,
+    on_error: callable | None = None,
 ) -> None:
     """
     Initialise the Capsera SDK.
@@ -141,6 +144,13 @@ def init(
         ``@agent`` decorator or ``tag()`` context manager.
     team:
         Default team name for the same purpose.
+    gateway:
+        Declare the AI gateway all traffic rides through (``"bifrost"``,
+        ``"litellm"``, ``"kong"``, ...). Only needed for self-hosted gateways
+        whose base_url Capsera cannot recognise — well-known gateway hosts
+        (OpenRouter, Portkey, Helicone, Cloudflare AI Gateway, a local
+        LiteLLM proxy) and the LiteLLM/Portkey client libraries are detected
+        and tagged automatically.
     env:
         Deployment environment tag (``"production"``, ``"staging"``, etc.).
     flush_interval_ms:
@@ -170,6 +180,7 @@ def init(
         endpoint=endpoint,
         default_agent=agent_name,
         default_team=team,
+        default_gateway=gateway,
         env=env,
         flush_interval_ms=flush_interval_ms,
         enable_routing=enable_routing,
@@ -220,10 +231,10 @@ def init(
 
 def agent(
     name: str,
-    team: Optional[str] = None,
-    task_type: Optional[str] = None,
-    customer_id: Optional[str] = None,
-    cost_center: Optional[str] = None,
+    team: str | None = None,
+    task_type: str | None = None,
+    customer_id: str | None = None,
+    cost_center: str | None = None,
 ):
     """
     Decorator that tags all LLM calls made within the decorated function.
@@ -294,11 +305,11 @@ def agent(
 @contextmanager
 def tag(
     agent: str,
-    team: Optional[str] = None,
-    task_type: Optional[str] = None,
-    session_id: Optional[str] = None,
-    customer_id: Optional[str] = None,
-    cost_center: Optional[str] = None,
+    team: str | None = None,
+    task_type: str | None = None,
+    session_id: str | None = None,
+    customer_id: str | None = None,
+    cost_center: str | None = None,
 ) -> Generator[None, None, None]:
     """
     Context manager that tags all LLM calls within the ``with`` block.
@@ -377,15 +388,16 @@ def record(
     output_tokens: int,
     model: str,
     provider: str,
-    cost_usd: Optional[float] = None,
-    agent_id: Optional[str] = None,
-    task_type: Optional[str] = None,
-    session_id: Optional[str] = None,
-    customer_id: Optional[str] = None,
-    cost_center: Optional[str] = None,
+    cost_usd: float | None = None,
+    agent_id: str | None = None,
+    task_type: str | None = None,
+    session_id: str | None = None,
+    customer_id: str | None = None,
+    cost_center: str | None = None,
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
     latency_ms: int = 0,
+    gateway: str | None = None,
 ) -> None:
     """
     Manually record a token usage event.
@@ -422,6 +434,9 @@ def record(
         Anthropic prompt cache write tokens (optional).
     latency_ms:
         End-to-end request latency in milliseconds (optional).
+    gateway:
+        AI gateway the call rode through (``"litellm"``, ``"portkey"``,
+        ``"bifrost"``, ...). Falls back to the ``init(gateway=...)`` default.
     """
     if _emitter is None:
         logger.warning(
@@ -459,7 +474,7 @@ def record(
 
     event = TokenEvent(
         id=str(uuid4()),
-        timestamp=datetime.now(timezone.utc).isoformat(),
+        timestamp=datetime.now(UTC).isoformat(),
         request_id=str(uuid4()),
         model=model,
         provider=provider,
@@ -476,6 +491,7 @@ def record(
         cost_center=resolved_cost_center,
         env=(cfg.env if cfg else "development"),
         latency_ms=latency_ms,
+        gateway=gateway or (cfg.default_gateway if cfg else None),
     )
     _emitter.enqueue(event)
 

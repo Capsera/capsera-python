@@ -9,7 +9,7 @@ content.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Optional
+from typing import Any
 
 from ._config import Config
 from ._models import PromptMetadata
@@ -96,7 +96,7 @@ class PromptAnalyzer:
 
     def _extract_system_prompt(
         self, kwargs: dict[str, Any], provider: str
-    ) -> Optional[str]:
+    ) -> str | None:
         if provider == "anthropic":
             system = kwargs.get("system")
             if system is None:
@@ -142,7 +142,7 @@ class PromptAnalyzer:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _estimate_tokens(text: Optional[str]) -> int:
+    def _estimate_tokens(text: str | None) -> int:
         if not text:
             return 0
         return max(1, len(text) // 4)

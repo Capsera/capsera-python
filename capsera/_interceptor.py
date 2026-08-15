@@ -18,8 +18,11 @@ Patching strategy
   that carries a ``usage`` object (requires ``stream_options={"include_usage": True}``
   which we inject automatically).
 * Google Gemini: ``google.generativeai.GenerativeModel.generate_content``
-  and ``generate_content_async`` plus ``google.genai.models.Models.generate_content``
-  when available.
+  and ``generate_content_async`` (legacy SDK), plus the modern ``google-genai``
+  package's sync AND async surfaces — ``models.Models.generate_content`` /
+  ``generate_content_stream`` and ``models.AsyncModels.generate_content`` /
+  ``generate_content_stream`` (``client.aio.models…``). Streaming usage is
+  taken from the last chunk carrying ``usage_metadata``.
 
 Call-stack inspection
 ---------------------
@@ -32,13 +35,14 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
-import sys
 import logging
+import sys
 import threading
 import time
 import weakref
-from datetime import datetime, timezone
-from typing import Any, AsyncGenerator, Generator, Optional
+from collections.abc import AsyncGenerator, Generator
+from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -68,8 +72,8 @@ logger = logging.getLogger("capsera")
 # --------------------------------------------------------------------------- #
 config: Config = None  # type: ignore[assignment]  # set by Interceptor.install()
 emitter: Emitter = None  # type: ignore[assignment]  # set by Interceptor.install()
-router: Optional[Router] = None
-analyzer: Optional[PromptAnalyzer] = None
+router: Router | None = None
+analyzer: PromptAnalyzer | None = None
 
 # Frames belonging to these path fragments are skipped when identifying the
 # true caller in the user's code.
@@ -97,8 +101,17 @@ _FRAMEWORK_DETECT = [
     ("crewai", "site-packages/crewai", "site-packages\\crewai"),
     ("llama_index", "site-packages/llama_index", "site-packages\\llama_index"),
     ("autogen", "site-packages/autogen", "site-packages\\autogen"),
+    # AutoGen 0.4+ ships as autogen_agentchat/autogen_core/autogen_ext with no
+    # top-level `autogen` module, so the row above never fires on modern
+    # installs. autogen_core is the base dependency of all three, so probing it
+    # covers every 0.4 layout; its fragment is a prefix of all their paths.
+    ("autogen_core", "site-packages/autogen", "site-packages\\autogen"),
     ("haystack", "site-packages/haystack", "site-packages\\haystack"),
     ("dspy", "site-packages/dspy", "site-packages\\dspy"),
+    # AI gateway client libraries — their frames must never be reported as the
+    # caller; the true caller is the user code above them.
+    ("litellm", "site-packages/litellm", "site-packages\\litellm"),
+    ("portkey_ai", "site-packages/portkey_ai", "site-packages\\portkey_ai"),
 ]
 
 _skip_fragments_initialized = False
@@ -106,7 +119,7 @@ _skip_fragments_initialized = False
 
 def _detect_frameworks() -> tuple[str, ...]:
     """Auto-detect installed AI frameworks and build the skip-frame list."""
-    global _skip_fragments_initialized
+    global _skip_fragments_initialized, _SKIP_FRAME_FRAGMENTS
     if _skip_fragments_initialized:
         return _SKIP_FRAME_FRAGMENTS
 
@@ -120,11 +133,63 @@ def _detect_frameworks() -> tuple[str, ...]:
         except ImportError:
             pass
 
+    # Persist before flipping the flag: the cached path above returns the
+    # GLOBAL, so computing without assigning it would make a second call
+    # return the stale base list (visible whenever _detect_frameworks runs
+    # outside install(), which assigns the global itself).
+    _SKIP_FRAME_FRAGMENTS = tuple(fragments)
     _skip_fragments_initialized = True
-    return tuple(fragments)
+    return _SKIP_FRAME_FRAGMENTS
 
 
 _SKIP_FRAME_FRAGMENTS: tuple[str, ...] = tuple(_SKIP_FRAME_FRAGMENTS_BASE)
+
+
+# --------------------------------------------------------------------------- #
+# Gateway double-count suppression
+#
+# LiteLLM (and potentially other gateway client libraries) internally drive
+# the very SDKs this module patches — litellm instantiates `openai.OpenAI`
+# clients for every OpenAI-compatible provider and boto3 for Bedrock. Without
+# suppression, one user-level `litellm.completion()` call would emit TWO
+# events: one from the gateway integration's callback (rich: gateway cost,
+# provider, attribution) and one from the inner patched provider method.
+#
+# When a gateway integration registers itself here (only after it successfully
+# installed its own capture hook), the provider patches skip calls whose stack
+# contains a frame inside that gateway's package. Matching is by exact path
+# COMPONENT ("…/site-packages/litellm/main.py" → component "litellm"), so a
+# user file merely named "litellm_helpers.py" never suppresses capture.
+# --------------------------------------------------------------------------- #
+_GATEWAY_SUPPRESS_PACKAGES: set[str] = set()
+
+
+def register_gateway_suppression(package: str) -> None:
+    """Mark provider calls originating inside ``package`` as gateway-internal.
+
+    Called by a gateway integration ONLY once its own capture hook is live —
+    if the hook failed to install, the inner provider patch keeps capturing
+    (partial data beats no data).
+    """
+    _GATEWAY_SUPPRESS_PACKAGES.add(package)
+
+
+def _suppressed_gateway_call() -> bool:
+    """True when the current provider call originates inside an active gateway
+    package (its own integration will record the call instead)."""
+    if not _GATEWAY_SUPPRESS_PACKAGES:
+        return False
+    try:
+        frame = sys._getframe(2)
+        while frame is not None:
+            filename = frame.f_code.co_filename
+            for seg in filename.replace("\\", "/").split("/"):
+                if seg in _GATEWAY_SUPPRESS_PACKAGES:
+                    return True
+            frame = frame.f_back
+    except Exception:
+        pass
+    return False
 
 
 def _caller_location(stack_start: int = 1) -> str:
@@ -163,11 +228,12 @@ def _build_event(
     cache_write_tokens: int,
     latency_ms: int,
     config: Config,
-    original_model: Optional[str] = None,
+    original_model: str | None = None,
     caller_file: str = "unknown",
-    prompt_meta: Optional[PromptMetadata] = None,
+    prompt_meta: PromptMetadata | None = None,
     is_error: bool = False,
-    error_type: Optional[str] = None,
+    error_type: str | None = None,
+    gateway: str | None = None,
 ) -> TokenEvent:
     """Construct a TokenEvent from extracted response data and current context."""
     ctx = _context_stack.current()
@@ -189,7 +255,7 @@ def _build_event(
 
     event = TokenEvent(
         id=str(uuid4()),
-        timestamp=datetime.now(timezone.utc).isoformat(),
+        timestamp=datetime.now(UTC).isoformat(),
         request_id=str(uuid4()),
         model=model,
         provider=provider,
@@ -207,6 +273,10 @@ def _build_event(
         env=config.env,
         latency_ms=latency_ms,
         caller_file=caller_file,
+        # Detected gateway wins; otherwise the init(gateway=...) declaration
+        # applies to every surface, including native providers with no
+        # base_url signal.
+        gateway=gateway or config.default_gateway,
         was_routed=original_model is not None,
         original_model=original_model,
         is_error=is_error,
@@ -290,6 +360,8 @@ def get_interception_report() -> dict[str, str]:
     probe("google.generativeai",
           _p("google.generativeai:GenerativeModel"), fn_flag("generate_content"))
     probe("google.genai", _p("google.genai:models.Models"), fn_flag("generate_content"))
+    probe("google.genai_async",
+          _p("google.genai:models.AsyncModels"), fn_flag("generate_content"))
     probe("mistral.chat_complete", _p("mistralai.chat:Chat"), method_flag("complete"))
     probe("cohere.chat", _p("cohere:ClientV2"), method_flag("chat"))
     probe("vertex.generate_content",
@@ -297,6 +369,13 @@ def get_interception_report() -> dict[str, str]:
           method_flag("generate_content"))
     probe("bedrock.converse", _p("botocore.client:BaseClient"),
           method_flag("_make_api_call"))
+    # Gateways: litellm capture is a registered callback (module-level flag),
+    # portkey is a class patch like the native providers.
+    probe("litellm.callbacks", lambda: __import__("litellm"),
+          lambda m: bool(getattr(m, "_capsera_patched", False)))
+    probe("portkey.chat_completions",
+          _p("portkey_ai.api_resources.apis.chat_complete:Completions"),
+          method_flag("create"))
     return report
 
 
@@ -313,8 +392,8 @@ class Interceptor:
         self,
         config: Config,
         emitter: Emitter,
-        router: Optional[Router] = None,
-        analyzer: Optional[PromptAnalyzer] = None,
+        router: Router | None = None,
+        analyzer: PromptAnalyzer | None = None,
     ) -> None:
         self._config = config
         self._emitter = emitter
@@ -357,6 +436,27 @@ class Interceptor:
         self._patch_cohere()
         self._patch_vertex()
         self._patch_bedrock()
+        # AI gateway client libraries (LiteLLM, Portkey). Installed AFTER the
+        # provider patches so a successful install can register double-count
+        # suppression against the already-patched inner SDKs.
+        self._patch_litellm()
+        self._patch_portkey()
+
+    # ================================================================== #
+    # AI gateways (LiteLLM, Portkey)
+    # ================================================================== #
+
+    def _patch_litellm(self) -> None:
+        """Register the Capsera callback with LiteLLM (skip when absent)."""
+        self._publish_runtime()
+        from .gateways import _litellm  # noqa: PLC0415 — avoid import cycle at module load
+        _litellm.install_litellm()
+
+    def _patch_portkey(self) -> None:
+        """Patch the Portkey SDK's chat/embeddings surfaces (skip when absent)."""
+        self._publish_runtime()
+        from .gateways import _portkey  # noqa: PLC0415 — avoid import cycle at module load
+        _portkey.install_portkey()
 
     # ================================================================== #
     # Native-SDK providers (Mistral, Cohere, Vertex, Bedrock)
@@ -490,6 +590,10 @@ class Interceptor:
                 service = getattr(svc, "service_name", "")
                 if service != "bedrock-runtime" or operation_name not in ("Converse", "ConverseStream"):
                     return original(self_client, operation_name, api_params)
+                # LiteLLM drives boto3 for Bedrock — its own integration
+                # records those calls, so skip to avoid double-counting.
+                if _suppressed_gateway_call():
+                    return original(self_client, operation_name, api_params)
                 caller = _caller_location()
                 model_id = (api_params.get("modelId", "unknown")
                             if isinstance(api_params, dict) else "unknown")
@@ -539,7 +643,10 @@ class Interceptor:
 
         @functools.wraps(original_create)
         def patched_create(self_client: Any, **kwargs: Any) -> Any:
+            if _suppressed_gateway_call():
+                return original_create(self_client, **kwargs)
             caller = _caller_location()
+            gateway = _detect_gateway(self_client)
             kwargs, original_model = _maybe_route(kwargs, config, router)
             prompt_meta = _maybe_analyze(kwargs, "anthropic", analyzer)
             preflight_original = _enforce_budget(kwargs, "anthropic", config, prompt_meta)
@@ -572,6 +679,7 @@ class Interceptor:
                 original_model=original_model,
                 caller_file=caller,
                 prompt_meta=prompt_meta,
+                gateway=gateway,
             )
             return response
 
@@ -585,7 +693,10 @@ class Interceptor:
 
             @functools.wraps(original_stream)
             def patched_stream(self_client: Any, **kwargs: Any) -> Any:
+                if _suppressed_gateway_call():
+                    return original_stream(self_client, **kwargs)
                 caller = _caller_location()
+                gateway = _detect_gateway(self_client)
                 kwargs, original_model = _maybe_route(kwargs, config, router)
                 prompt_meta = _maybe_analyze(kwargs, "anthropic", analyzer)
                 preflight_original = _enforce_budget(kwargs, "anthropic", config, prompt_meta)
@@ -617,6 +728,7 @@ class Interceptor:
                     original_model=original_model,
                     caller_file=caller,
                     prompt_meta=prompt_meta,
+                    gateway=gateway,
                 )
 
             messages_cls.stream = patched_stream
@@ -639,7 +751,10 @@ class Interceptor:
 
         @functools.wraps(original_create)
         async def async_patched_create(self_client: Any, **kwargs: Any) -> Any:
+            if _suppressed_gateway_call():
+                return await original_create(self_client, **kwargs)
             caller = _caller_location()
+            gateway = _detect_gateway(self_client)
             kwargs, original_model = _maybe_route(kwargs, config, router)
             prompt_meta = _maybe_analyze(kwargs, "anthropic", analyzer)
             preflight_original = await _enforce_budget_async(kwargs, "anthropic", config, prompt_meta)
@@ -672,6 +787,7 @@ class Interceptor:
                 original_model=original_model,
                 caller_file=caller,
                 prompt_meta=prompt_meta,
+                gateway=gateway,
             )
             return response
 
@@ -683,7 +799,10 @@ class Interceptor:
 
             @functools.wraps(original_stream)
             def async_patched_stream(self_client: Any, **kwargs: Any) -> Any:
+                if _suppressed_gateway_call():
+                    return original_stream(self_client, **kwargs)
                 caller = _caller_location()
+                gateway = _detect_gateway(self_client)
                 kwargs, original_model = _maybe_route(kwargs, config, router)
                 prompt_meta = _maybe_analyze(kwargs, "anthropic", analyzer)
                 preflight_original = _enforce_budget(kwargs, "anthropic", config, prompt_meta)
@@ -713,6 +832,7 @@ class Interceptor:
                     original_model=original_model,
                     caller_file=caller,
                     prompt_meta=prompt_meta,
+                    gateway=gateway,
                 )
 
             async_messages_cls.stream = async_patched_stream
@@ -749,9 +869,12 @@ class Interceptor:
 
         @functools.wraps(original_create)
         def patched_create(self_client: Any, **kwargs: Any) -> Any:
+            if _suppressed_gateway_call():
+                return original_create(self_client, **kwargs)
             caller = _caller_location()
             kwargs, original_model = _maybe_route(kwargs, config, router)
             provider = _openai_provider(self_client, kwargs.get("model", ""))
+            gateway = _detect_gateway(self_client)
             prompt_meta = _maybe_analyze(kwargs, "openai", analyzer)
             preflight_original = _enforce_budget(kwargs, "openai", config, prompt_meta)
             original_model = original_model or preflight_original
@@ -791,6 +914,7 @@ class Interceptor:
                     caller_file=caller,
                     prompt_meta=prompt_meta,
                     provider=provider,
+                    gateway=gateway,
                 )
 
             latency_ms = int((time.perf_counter() - start) * 1000)
@@ -804,6 +928,7 @@ class Interceptor:
                 caller_file=caller,
                 prompt_meta=prompt_meta,
                 provider=provider,
+                gateway=gateway,
             )
             return response
 
@@ -828,9 +953,12 @@ class Interceptor:
 
         @functools.wraps(original_create)
         async def async_patched_create(self_client: Any, **kwargs: Any) -> Any:
+            if _suppressed_gateway_call():
+                return await original_create(self_client, **kwargs)
             caller = _caller_location()
             kwargs, original_model = _maybe_route(kwargs, config, router)
             provider = _openai_provider(self_client, kwargs.get("model", ""))
+            gateway = _detect_gateway(self_client)
             prompt_meta = _maybe_analyze(kwargs, "openai", analyzer)
             preflight_original = await _enforce_budget_async(kwargs, "openai", config, prompt_meta)
             original_model = original_model or preflight_original
@@ -869,6 +997,7 @@ class Interceptor:
                     caller_file=caller,
                     prompt_meta=prompt_meta,
                     provider=provider,
+                    gateway=gateway,
                 )
 
             latency_ms = int((time.perf_counter() - start) * 1000)
@@ -882,6 +1011,7 @@ class Interceptor:
                 caller_file=caller,
                 prompt_meta=prompt_meta,
                 provider=provider,
+                gateway=gateway,
             )
             return response
 
@@ -1015,50 +1145,236 @@ class Interceptor:
         return patched
 
     def _patch_google_genai(self, google_genai: Any) -> bool:
+        """Patch the modern ``google-genai`` SDK: sync AND async surfaces.
+
+        ``client.models`` is a ``Models`` instance and ``client.aio.models``
+        an ``AsyncModels`` instance — an async app (an AutoGen model client,
+        a FastAPI handler) never touches the sync class, so patching only
+        ``Models`` left every ``await client.aio.models.generate_content()``
+        call invisible at runtime. Streaming variants are wrapped too: usage
+        arrives on the final chunk, so the relay tracks the last chunk that
+        carries ``usage_metadata`` and emits when the consumer exhausts (or
+        abandons) the stream.
+        """
         self._publish_runtime()
         models_mod = getattr(google_genai, "models", None)
-        models_cls = getattr(models_mod, "Models", None)
+        patched = self._patch_google_genai_sync(getattr(models_mod, "Models", None))
+        patched = self._patch_google_genai_async(getattr(models_mod, "AsyncModels", None)) or patched
+        return patched
+
+    def _patch_google_genai_sync(self, models_cls: Any) -> bool:
         if models_cls is None or not hasattr(models_cls, "generate_content"):
             return False
-        if getattr(models_cls.generate_content, "_capsera_patched", False):
-            return True
 
-        original_generate = models_cls.generate_content
+        patched = False
+        if not getattr(models_cls.generate_content, "_capsera_patched", False):
+            original_generate = models_cls.generate_content
 
-        @functools.wraps(original_generate)
-        def patched_generate(self_models: Any, *args: Any, **kwargs: Any) -> Any:
-            caller = _caller_location()
-            call_kwargs = dict(kwargs)
-            prompt_meta = _maybe_analyze(call_kwargs, "google", analyzer)
-            preflight_original = _enforce_budget(call_kwargs, "google", config, prompt_meta)
-            original_model = preflight_original
+            @functools.wraps(original_generate)
+            def patched_generate(self_models: Any, *args: Any, **kwargs: Any) -> Any:
+                caller = _caller_location()
+                call_kwargs = dict(kwargs)
+                prompt_meta = _maybe_analyze(call_kwargs, "google", analyzer)
+                original_model = _enforce_budget(call_kwargs, "google", config, prompt_meta)
 
-            start = time.perf_counter()
-            try:
-                response = original_generate(self_models, *args, **call_kwargs)
-            except Exception as exc:
-                _emit_simple_error(provider="google",
-                                   model=call_kwargs.get("model", "unknown"),
-                                   start=start, error=exc, caller_file=caller)
-                raise
-            latency_ms = int((time.perf_counter() - start) * 1000)
-            _emit_google_response(
-                response=response,
-                request_kwargs=call_kwargs,
-                latency_ms=latency_ms,
-                config=config,
-                emitter=emitter,
-                original_model=original_model,
-                caller_file=caller,
-                prompt_meta=prompt_meta,
-            )
-            return response
+                start = time.perf_counter()
+                try:
+                    response = original_generate(self_models, *args, **call_kwargs)
+                except Exception as exc:
+                    _emit_simple_error(provider="google",
+                                       model=call_kwargs.get("model", "unknown"),
+                                       start=start, error=exc, caller_file=caller)
+                    raise
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                _emit_google_response(
+                    response=response,
+                    request_kwargs=call_kwargs,
+                    latency_ms=latency_ms,
+                    config=config,
+                    emitter=emitter,
+                    original_model=original_model,
+                    caller_file=caller,
+                    prompt_meta=prompt_meta,
+                )
+                return response
 
-        patched_generate._capsera_patched = True  # type: ignore[attr-defined]
-        models_cls.generate_content = patched_generate
-        if self._config.debug:
-            logger.debug("capsera: patched google.genai.models.Models.generate_content")
-        return True
+            patched_generate._capsera_patched = True  # type: ignore[attr-defined]
+            models_cls.generate_content = patched_generate
+            patched = True
+
+        if hasattr(models_cls, "generate_content_stream") and not getattr(
+            models_cls.generate_content_stream, "_capsera_patched", False
+        ):
+            original_stream = models_cls.generate_content_stream
+
+            @functools.wraps(original_stream)
+            def patched_stream(self_models: Any, *args: Any, **kwargs: Any) -> Any:
+                caller = _caller_location()
+                call_kwargs = dict(kwargs)
+                prompt_meta = _maybe_analyze(call_kwargs, "google", analyzer)
+                original_model = _enforce_budget(call_kwargs, "google", config, prompt_meta)
+                start = time.perf_counter()
+                try:
+                    stream = original_stream(self_models, *args, **call_kwargs)
+                except Exception as exc:
+                    _emit_simple_error(provider="google",
+                                       model=call_kwargs.get("model", "unknown"),
+                                       start=start, error=exc, caller_file=caller)
+                    raise
+
+                def relay() -> Any:
+                    final = None
+                    try:
+                        for chunk in stream:
+                            if getattr(chunk, "usage_metadata", None) is not None:
+                                final = chunk
+                            yield chunk
+                    except Exception as exc:
+                        _emit_simple_error(provider="google",
+                                           model=call_kwargs.get("model", "unknown"),
+                                           start=start, error=exc, caller_file=caller)
+                        raise
+                    # final=None (no chunk carried usage) degrades to a
+                    # zero-token event — the call is still visible.
+                    _emit_google_response(
+                        response=final,
+                        request_kwargs=call_kwargs,
+                        latency_ms=int((time.perf_counter() - start) * 1000),
+                        config=config,
+                        emitter=emitter,
+                        original_model=original_model,
+                        caller_file=caller,
+                        prompt_meta=prompt_meta,
+                    )
+
+                return relay()
+
+            patched_stream._capsera_patched = True  # type: ignore[attr-defined]
+            models_cls.generate_content_stream = patched_stream
+            patched = True
+
+        if patched and self._config.debug:
+            logger.debug("capsera: patched google.genai.models.Models")
+        return patched
+
+    def _patch_google_genai_async(self, models_cls: Any) -> bool:
+        if models_cls is None or not hasattr(models_cls, "generate_content"):
+            return False
+
+        patched = False
+        if not getattr(models_cls.generate_content, "_capsera_patched", False):
+            original_generate = models_cls.generate_content
+
+            @functools.wraps(original_generate)
+            async def patched_generate(self_models: Any, *args: Any, **kwargs: Any) -> Any:
+                caller = _caller_location()
+                call_kwargs = dict(kwargs)
+                prompt_meta = _maybe_analyze(call_kwargs, "google", analyzer)
+                original_model = await _enforce_budget_async(call_kwargs, "google", config, prompt_meta)
+
+                start = time.perf_counter()
+                try:
+                    response = await original_generate(self_models, *args, **call_kwargs)
+                except Exception as exc:
+                    _emit_simple_error(provider="google",
+                                       model=call_kwargs.get("model", "unknown"),
+                                       start=start, error=exc, caller_file=caller)
+                    raise
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                _emit_google_response(
+                    response=response,
+                    request_kwargs=call_kwargs,
+                    latency_ms=latency_ms,
+                    config=config,
+                    emitter=emitter,
+                    original_model=original_model,
+                    caller_file=caller,
+                    prompt_meta=prompt_meta,
+                )
+                return response
+
+            patched_generate._capsera_patched = True  # type: ignore[attr-defined]
+            models_cls.generate_content = patched_generate
+            patched = True
+
+        if hasattr(models_cls, "generate_content_stream") and not getattr(
+            models_cls.generate_content_stream, "_capsera_patched", False
+        ):
+            original_stream = models_cls.generate_content_stream
+
+            def _async_relay(stream: Any, call_kwargs: dict[str, Any], start: float,
+                             original_model: str | None, caller: str,
+                             prompt_meta: Any) -> Any:
+                async def relay() -> Any:
+                    final = None
+                    try:
+                        async for chunk in stream:
+                            if getattr(chunk, "usage_metadata", None) is not None:
+                                final = chunk
+                            yield chunk
+                    except Exception as exc:
+                        _emit_simple_error(provider="google",
+                                           model=call_kwargs.get("model", "unknown"),
+                                           start=start, error=exc, caller_file=caller)
+                        raise
+                    _emit_google_response(
+                        response=final,
+                        request_kwargs=call_kwargs,
+                        latency_ms=int((time.perf_counter() - start) * 1000),
+                        config=config,
+                        emitter=emitter,
+                        original_model=original_model,
+                        caller_file=caller,
+                        prompt_meta=prompt_meta,
+                    )
+
+                return relay()
+
+            # google-genai's AsyncModels.generate_content_stream is an `async
+            # def` returning an AsyncIterator (callers await it, then `async
+            # for`). Preserve whichever calling convention this version has —
+            # replacing an awaitable with a bare generator (or vice versa)
+            # would break every caller.
+            if inspect.iscoroutinefunction(original_stream):
+                @functools.wraps(original_stream)
+                async def patched_astream(self_models: Any, *args: Any, **kwargs: Any) -> Any:
+                    caller = _caller_location()
+                    call_kwargs = dict(kwargs)
+                    prompt_meta = _maybe_analyze(call_kwargs, "google", analyzer)
+                    original_model = await _enforce_budget_async(call_kwargs, "google", config, prompt_meta)
+                    start = time.perf_counter()
+                    try:
+                        stream = await original_stream(self_models, *args, **call_kwargs)
+                    except Exception as exc:
+                        _emit_simple_error(provider="google",
+                                           model=call_kwargs.get("model", "unknown"),
+                                           start=start, error=exc, caller_file=caller)
+                        raise
+                    return _async_relay(stream, call_kwargs, start, original_model, caller, prompt_meta)
+            else:
+                @functools.wraps(original_stream)
+                def patched_astream(self_models: Any, *args: Any, **kwargs: Any) -> Any:
+                    caller = _caller_location()
+                    call_kwargs = dict(kwargs)
+                    prompt_meta = _maybe_analyze(call_kwargs, "google", analyzer)
+                    original_model = _enforce_budget(call_kwargs, "google", config, prompt_meta)
+                    start = time.perf_counter()
+                    try:
+                        stream = original_stream(self_models, *args, **call_kwargs)
+                    except Exception as exc:
+                        _emit_simple_error(provider="google",
+                                           model=call_kwargs.get("model", "unknown"),
+                                           start=start, error=exc, caller_file=caller)
+                        raise
+                    return _async_relay(stream, call_kwargs, start, original_model, caller, prompt_meta)
+
+            patched_astream._capsera_patched = True  # type: ignore[attr-defined]
+            models_cls.generate_content_stream = patched_astream
+            patched = True
+
+        if patched and self._config.debug:
+            logger.debug("capsera: patched google.genai.models.AsyncModels")
+        return patched
 
     # ================================================================== #
     # OpenAI Embeddings
@@ -1087,8 +1403,11 @@ class Interceptor:
 
         @functools.wraps(original_create)
         def patched_create(self_client: Any, **kwargs: Any) -> Any:
+            if _suppressed_gateway_call():
+                return original_create(self_client, **kwargs)
             caller = _caller_location()
             provider = _openai_provider(self_client, kwargs.get("model", ""))
+            gateway = _detect_gateway(self_client)
             start = time.perf_counter()
             try:
                 response = original_create(self_client, **kwargs)
@@ -1107,6 +1426,7 @@ class Interceptor:
                 emitter=emitter,
                 caller_file=caller,
                 provider=provider,
+                gateway=gateway,
             )
             return response
 
@@ -1129,8 +1449,11 @@ class Interceptor:
 
         @functools.wraps(original_create)
         async def async_patched_create(self_client: Any, **kwargs: Any) -> Any:
+            if _suppressed_gateway_call():
+                return await original_create(self_client, **kwargs)
             caller = _caller_location()
             provider = _openai_provider(self_client, kwargs.get("model", ""))
+            gateway = _detect_gateway(self_client)
             start = time.perf_counter()
             try:
                 response = await original_create(self_client, **kwargs)
@@ -1149,6 +1472,7 @@ class Interceptor:
                 emitter=emitter,
                 caller_file=caller,
                 provider=provider,
+                gateway=gateway,
             )
             return response
 
@@ -1172,9 +1496,9 @@ def _emit_error_event(
     error: BaseException,
     config: Config,
     emitter: Emitter,
-    original_model: Optional[str],
+    original_model: str | None,
     caller_file: str,
-    prompt_meta: Optional[PromptMetadata] = None,
+    prompt_meta: PromptMetadata | None = None,
 ) -> None:
     """Record a failed LLM call as a zero-cost error event.
 
@@ -1234,9 +1558,10 @@ def _emit_anthropic_response(
     latency_ms: int,
     config: Config,
     emitter: Emitter,
-    original_model: Optional[str],
+    original_model: str | None,
     caller_file: str,
-    prompt_meta: Optional[PromptMetadata] = None,
+    prompt_meta: PromptMetadata | None = None,
+    gateway: str | None = None,
 ) -> None:
     """Extract usage from an Anthropic Message response and enqueue an event."""
     try:
@@ -1253,6 +1578,7 @@ def _emit_anthropic_response(
             original_model=original_model,
             caller_file=caller_file,
             prompt_meta=prompt_meta,
+            gateway=gateway,
         )
         emitter.enqueue(event)
     except Exception:
@@ -1323,25 +1649,46 @@ def _emit_native_response(
             logger.exception("capsera: failed to record %s response", provider)
 
 
+def _client_base_url(self_client: Any) -> str | None:
+    """Extract the configured base_url from a patched resource's client.
+
+    A real resource object (``Completions``, ``Messages``, ...) carries the
+    top-level SDK client on ``self._client`` (which has ``base_url``); fall
+    back to a direct ``base_url`` attribute.
+    """
+    for obj in (getattr(self_client, "_client", None), self_client):
+        bu = getattr(obj, "base_url", None)
+        if bu:
+            return str(bu)
+    return None
+
+
 def _openai_provider(self_client: Any, model: str) -> str:
     """Resolve the provider for a call captured through the ``openai`` SDK.
 
     OpenAI-compatible providers (Groq, DeepSeek, xAI, Together, Fireworks,
     Perplexity, OpenRouter, Azure, local Ollama/vLLM) all ride this same SDK,
     so the client's ``base_url`` is the only capture-time signal that
-    distinguishes them from real OpenAI. A real ``Completions`` resource
-    carries the top-level client on ``self._client`` (which has ``base_url``);
-    fall back to a direct ``base_url`` attribute, then to the catalog's
-    declared provider for the model, then ``"openai"``.
+    distinguishes them from real OpenAI. Falls back to the catalog's declared
+    provider for the model, then ``"openai"``.
     """
-    base_url = None
-    for obj in (getattr(self_client, "_client", None), self_client):
-        bu = getattr(obj, "base_url", None)
-        if bu:
-            base_url = str(bu)
-            break
-    resolved = _catalog.provider_for(model or "", base_url=base_url)
+    resolved = _catalog.provider_for(model or "", base_url=_client_base_url(self_client))
     return resolved if resolved != "unknown" else "openai"
+
+
+def _detect_gateway(self_client: Any) -> str | None:
+    """Resolve the AI gateway a patched-SDK call rides through, if any.
+
+    OpenAI-compatible gateways (OpenRouter, Portkey, Helicone, Bifrost,
+    Cloudflare AI Gateway, a LiteLLM proxy, ...) are addressed by pointing the
+    provider SDK's ``base_url`` at the gateway, so the host is the capture
+    signal. Returns None when unrecognised — ``_build_event`` then falls back
+    to ``config.default_gateway``.
+    """
+    try:
+        return _catalog.gateway_for(_client_base_url(self_client))
+    except Exception:
+        return None
 
 
 def _emit_openai_response(
@@ -1351,10 +1698,11 @@ def _emit_openai_response(
     latency_ms: int,
     config: Config,
     emitter: Emitter,
-    original_model: Optional[str],
+    original_model: str | None,
     caller_file: str,
-    prompt_meta: Optional[PromptMetadata] = None,
+    prompt_meta: PromptMetadata | None = None,
     provider: str = "openai",
+    gateway: str | None = None,
 ) -> None:
     """Extract usage from an OpenAI ChatCompletion response and enqueue an event."""
     try:
@@ -1375,6 +1723,7 @@ def _emit_openai_response(
             original_model=original_model,
             caller_file=caller_file,
             prompt_meta=prompt_meta,
+            gateway=gateway,
         )
         emitter.enqueue(event)
     except Exception:
@@ -1391,6 +1740,7 @@ def _emit_openai_embedding_response(
     emitter: Emitter,
     caller_file: str,
     provider: str = "openai",
+    gateway: str | None = None,
 ) -> None:
     """Extract usage from an OpenAI Embedding response and enqueue an event."""
     try:
@@ -1410,6 +1760,7 @@ def _emit_openai_embedding_response(
             config=config,
             original_model=None,
             caller_file=caller_file,
+            gateway=gateway,
         )
         event.task_type = event.task_type or "embedding"
         emitter.enqueue(event)
@@ -1436,9 +1787,9 @@ def _emit_google_response(
     latency_ms: int,
     config: Config,
     emitter: Emitter,
-    original_model: Optional[str],
+    original_model: str | None,
     caller_file: str,
-    prompt_meta: Optional[PromptMetadata] = None,
+    prompt_meta: PromptMetadata | None = None,
 ) -> None:
     """Extract usage from a Google Gemini response and enqueue an event."""
     try:
@@ -1476,8 +1827,8 @@ def _emit_google_response(
 def _maybe_analyze(
     kwargs: dict[str, Any],
     provider: str,
-    analyzer: Optional[PromptAnalyzer] = None,
-) -> Optional[PromptMetadata]:
+    analyzer: PromptAnalyzer | None = None,
+) -> PromptMetadata | None:
     """Run prompt analysis if enabled. Fail-open: exceptions return None."""
     if analyzer is None:
         return None
@@ -1487,7 +1838,7 @@ def _maybe_analyze(
         return None
 
 
-def _estimate_request_cost(kwargs: dict[str, Any], provider: str, prompt_meta: Optional[PromptMetadata]) -> float:
+def _estimate_request_cost(kwargs: dict[str, Any], provider: str, prompt_meta: PromptMetadata | None) -> float:
     model = kwargs.get("model", "")
     if not model:
         return 0.0
@@ -1517,7 +1868,7 @@ def _budget_check_payload(
     kwargs: dict[str, Any],
     provider: str,
     config: Config,
-    prompt_meta: Optional[PromptMetadata],
+    prompt_meta: PromptMetadata | None,
 ) -> dict[str, Any]:
     ctx = _context_stack.current()
     agent_id = (ctx.agent if ctx else None) or config.default_agent or "unknown"
@@ -1546,7 +1897,7 @@ def _apply_preflight_decision(
     kwargs: dict[str, Any],
     decision: dict[str, Any],
     config: Config,
-) -> Optional[str]:
+) -> str | None:
     _raise_if_blocked(decision)
     if decision.get("action") != "downgrade":
         return None
@@ -1579,11 +1930,11 @@ def _apply_preflight_decision(
 
 _BudgetClientKey = tuple[str, str, float]
 
-_sync_budget_client: Optional[httpx.Client] = None
-_sync_budget_client_key: Optional[_BudgetClientKey] = None
+_sync_budget_client: httpx.Client | None = None
+_sync_budget_client_key: _BudgetClientKey | None = None
 _sync_budget_client_lock = threading.Lock()
 
-_async_budget_clients: "weakref.WeakKeyDictionary[Any, tuple[_BudgetClientKey, httpx.AsyncClient]]" = (
+_async_budget_clients: weakref.WeakKeyDictionary[Any, tuple[_BudgetClientKey, httpx.AsyncClient]] = (
     weakref.WeakKeyDictionary()
 )
 _async_budget_clients_lock = threading.Lock()
@@ -1654,8 +2005,8 @@ def _enforce_budget(
     kwargs: dict[str, Any],
     provider: str,
     config: Config,
-    prompt_meta: Optional[PromptMetadata],
-) -> Optional[str]:
+    prompt_meta: PromptMetadata | None,
+) -> str | None:
     if not config.enable_budget_enforcement:
         return None
     try:
@@ -1677,8 +2028,8 @@ async def _enforce_budget_async(
     kwargs: dict[str, Any],
     provider: str,
     config: Config,
-    prompt_meta: Optional[PromptMetadata],
-) -> Optional[str]:
+    prompt_meta: PromptMetadata | None,
+) -> str | None:
     if not config.enable_budget_enforcement:
         return None
     try:
@@ -1699,8 +2050,8 @@ async def _enforce_budget_async(
 def _maybe_route(
     kwargs: dict[str, Any],
     config: Config,
-    router: Optional[Router] = None,
-) -> tuple[dict[str, Any], Optional[str]]:
+    router: Router | None = None,
+) -> tuple[dict[str, Any], str | None]:
     """
     Apply model routing if enabled.
 
@@ -1740,9 +2091,10 @@ class _AnthropicStreamProxy:
         request_kwargs: dict[str, Any],
         config: Config,
         emitter: Emitter,
-        original_model: Optional[str],
+        original_model: str | None,
         caller_file: str,
-        prompt_meta: Optional[PromptMetadata] = None,
+        prompt_meta: PromptMetadata | None = None,
+        gateway: str | None = None,
     ) -> None:
         self._stream_mgr = stream_mgr
         self._start_time = start_time
@@ -1752,6 +2104,7 @@ class _AnthropicStreamProxy:
         self._original_model = original_model
         self._caller_file = caller_file
         self._prompt_meta = prompt_meta
+        self._gateway = gateway
 
     def __enter__(self) -> Any:
         self._entered_stream = self._stream_mgr.__enter__()
@@ -1796,6 +2149,7 @@ class _AnthropicStreamProxy:
                     original_model=self._original_model,
                     caller_file=self._caller_file,
                     prompt_meta=self._prompt_meta,
+                    gateway=self._gateway,
                 )
         except Exception:
             if self._config.debug:
@@ -1812,9 +2166,10 @@ class _AnthropicAsyncStreamProxy:
         request_kwargs: dict[str, Any],
         config: Config,
         emitter: Emitter,
-        original_model: Optional[str],
+        original_model: str | None,
         caller_file: str,
-        prompt_meta: Optional[PromptMetadata] = None,
+        prompt_meta: PromptMetadata | None = None,
+        gateway: str | None = None,
     ) -> None:
         self._stream_mgr = stream_mgr
         self._start_time = start_time
@@ -1824,6 +2179,7 @@ class _AnthropicAsyncStreamProxy:
         self._original_model = original_model
         self._caller_file = caller_file
         self._prompt_meta = prompt_meta
+        self._gateway = gateway
 
     async def __aenter__(self) -> Any:
         self._entered_stream = await self._stream_mgr.__aenter__()
@@ -1852,6 +2208,7 @@ class _AnthropicAsyncStreamProxy:
                     original_model=self._original_model,
                     caller_file=self._caller_file,
                     prompt_meta=self._prompt_meta,
+                    gateway=self._gateway,
                 )
         except Exception:
             if self._config.debug:
@@ -1882,12 +2239,14 @@ class _OpenAIStreamWrapper:
         request_kwargs: dict[str, Any],
         config: Config,
         emitter: Emitter,
-        original_model: Optional[str],
+        original_model: str | None,
         caller_file: str,
-        prompt_meta: Optional[PromptMetadata] = None,
+        prompt_meta: PromptMetadata | None = None,
         provider: str = "openai",
+        gateway: str | None = None,
     ) -> None:
         self._provider = provider
+        self._gateway = gateway
         self._stream = stream
         self._start_time = start_time
         self._request_kwargs = request_kwargs
@@ -1910,7 +2269,7 @@ class _OpenAIStreamWrapper:
         finally:
             self._record()
 
-    def __enter__(self) -> "_OpenAIStreamWrapper":
+    def __enter__(self) -> _OpenAIStreamWrapper:
         return self
 
     def __exit__(self, *args: Any) -> None:
@@ -1936,6 +2295,7 @@ class _OpenAIStreamWrapper:
                 original_model=self._original_model,
                 caller_file=self._caller_file,
                 prompt_meta=self._prompt_meta,
+                gateway=self._gateway,
             )
             self._emitter.enqueue(event)
         except Exception:
@@ -1953,12 +2313,14 @@ class _OpenAIAsyncStreamWrapper:
         request_kwargs: dict[str, Any],
         config: Config,
         emitter: Emitter,
-        original_model: Optional[str],
+        original_model: str | None,
         caller_file: str,
-        prompt_meta: Optional[PromptMetadata] = None,
+        prompt_meta: PromptMetadata | None = None,
         provider: str = "openai",
+        gateway: str | None = None,
     ) -> None:
         self._provider = provider
+        self._gateway = gateway
         self._stream = stream
         self._start_time = start_time
         self._request_kwargs = request_kwargs
@@ -1981,7 +2343,7 @@ class _OpenAIAsyncStreamWrapper:
         finally:
             self._record()
 
-    async def __aenter__(self) -> "_OpenAIAsyncStreamWrapper":
+    async def __aenter__(self) -> _OpenAIAsyncStreamWrapper:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -2007,6 +2369,7 @@ class _OpenAIAsyncStreamWrapper:
                 original_model=self._original_model,
                 caller_file=self._caller_file,
                 prompt_meta=self._prompt_meta,
+                gateway=self._gateway,
             )
             self._emitter.enqueue(event)
         except Exception:
