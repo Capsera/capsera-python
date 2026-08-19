@@ -386,6 +386,7 @@ def test_entry_wrapper_blocks_on_budget(config, emitter, fake_litellm, monkeypat
     fake_litellm.completion = original  # recorder must exist BEFORE install wraps it
     _install(config, emitter)
 
+    config.enforcement_mode = "strict"  # this test is about the round trip
     blocked = {"allowed": False, "action": "block", "message": "budget exhausted"}
     fake_client = _FakeBudgetClient(blocked)
     monkeypatch.setattr(_runtime, "_get_sync_budget_client", lambda cfg: fake_client)
@@ -402,6 +403,7 @@ def test_entry_wrapper_blocks_on_budget(config, emitter, fake_litellm, monkeypat
 
 def test_entry_wrapper_injects_capsera_metadata(config, emitter, fake_litellm, monkeypatch):
     _install(config, emitter)
+    config.enforcement_mode = "strict"
     monkeypatch.setattr(
         _runtime, "_get_sync_budget_client",
         lambda cfg: _FakeBudgetClient({"allowed": True, "action": "allow"}),
@@ -432,6 +434,7 @@ def test_entry_wrapper_fails_open_when_backend_down(config, emitter, fake_litell
     def broken_client(cfg):
         raise ConnectionError("backend unreachable")
 
+    config.enforcement_mode = "strict"
     monkeypatch.setattr(_runtime, "_get_sync_budget_client", broken_client)
     result = fake_litellm.completion(model="gpt-4o", messages=[])
     assert result is not None  # call passed through

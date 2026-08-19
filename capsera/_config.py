@@ -28,6 +28,18 @@ class Config:
     routing_refresh_interval: int = 60
     critical_task_types: list[str] = field(default_factory=list)
     enable_budget_enforcement: bool = True
+    # "local"  — evaluate against a background-refreshed snapshot, no network
+    #            on the hot path. The default: a blocking check per LLM call
+    #            put our availability in front of the customer's.
+    # "strict" — POST /v1/budgets/check and wait. Zero overshoot, at the cost
+    #            of a round trip per call. For workloads where a single call
+    #            over the cap is genuinely unacceptable.
+    # "off"    — record spend, enforce nothing.
+    enforcement_mode: str = "local"
+    # Persist the snapshot to the system temp dir so a short-lived process
+    # (Lambda, CLI, worker that exits) enforces from its first call rather
+    # than never reaching a refresh.
+    budget_cache_persist: bool = True
     budget_check_timeout: float = 1.0
     enable_prompt_analysis: bool = False
     prompt_size_threshold: int = 4000
@@ -37,6 +49,13 @@ class Config:
     def __post_init__(self) -> None:
         # Normalise endpoint — strip trailing slash so we can always append paths cleanly
         self.endpoint = self.endpoint.rstrip("/")
+        # enable_budget_enforcement=False is the documented opt-out and predates
+        # enforcement_mode. Honour it whatever the mode says, so existing code
+        # that disables enforcement does not silently regain it on upgrade.
+        if not self.enable_budget_enforcement:
+            self.enforcement_mode = "off"
+        elif self.enforcement_mode not in ("local", "strict", "off"):
+            self.enforcement_mode = "local"
 
 
 class _GlobalConfig:

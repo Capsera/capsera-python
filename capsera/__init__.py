@@ -47,6 +47,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
+from ._budget_engine import BudgetEngine
 from ._config import Config, _global_config
 from ._context import AgentContext, _context_stack
 from ._emitter import Emitter
@@ -98,6 +99,7 @@ _emitter: Emitter | None = None
 _interceptor: Interceptor | None = None
 _router: Router | None = None
 _analyzer: PromptAnalyzer | None = None
+_budget_engine: BudgetEngine | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -117,6 +119,8 @@ def init(
     routing_refresh_interval: int = 60,
     critical_task_types: list[str] | None = None,
     enable_budget_enforcement: bool = True,
+    enforcement_mode: str = "local",
+    budget_cache_persist: bool = True,
     budget_check_timeout: float = 1.0,
     enable_prompt_analysis: bool = False,
     prompt_size_threshold: int = 4000,
@@ -161,6 +165,26 @@ def init(
         Enable the model routing rules engine.  When ``True``, routing rules
         fetched from the backend may downgrade expensive models to cheaper
         ones before the API call is made.
+    enforcement_mode:
+        How budgets are enforced.
+
+        ``"local"`` (default) evaluates in-process against a snapshot
+        refreshed in the background, so no network call sits in front of the
+        provider request. One snapshot fetch happens at init() time; after
+        that, refreshes ride on the event flush the SDK already makes.
+
+        ``"strict"`` asks the backend per call (``POST /v1/budgets/check``)
+        and waits. Zero overshoot, at the cost of a round trip on every LLM
+        request — appropriate when a single call over the cap is genuinely
+        unacceptable.
+
+        ``"off"`` records spend and enforces nothing. Passing
+        ``enable_budget_enforcement=False`` forces this regardless of mode.
+    budget_cache_persist:
+        Whether the budget snapshot is cached on disk (system temp dir, keyed
+        by a hash of endpoint + API key). Keeps enforcement working from the
+        first call in short-lived processes. Set False for read-only or
+        shared filesystems where the write is unwanted.
     enable_budget_enforcement:
         Enable a pre-call budget check against the backend. **On by default.**
         Blocking budgets stop calls before provider spend occurs; throttle and
@@ -173,7 +197,7 @@ def init(
     debug:
         Log detailed SDK activity to the ``capsera`` logger at INFO level.
     """
-    global _emitter, _interceptor, _router, _analyzer
+    global _emitter, _interceptor, _router, _analyzer, _budget_engine
 
     config = Config(
         api_key=api_key,
@@ -188,6 +212,8 @@ def init(
         routing_refresh_interval=routing_refresh_interval,
         critical_task_types=critical_task_types or [],
         enable_budget_enforcement=enable_budget_enforcement,
+        enforcement_mode=enforcement_mode,
+        budget_cache_persist=budget_cache_persist,
         budget_check_timeout=budget_check_timeout,
         enable_prompt_analysis=enable_prompt_analysis,
         prompt_size_threshold=prompt_size_threshold,
@@ -206,13 +232,31 @@ def init(
         # provider methods resolve the active emitter at call time (see
         # _interceptor's module runtime), so new calls use the new emitter.
         _emitter.shutdown()
-    _emitter = Emitter(config, max_retries=max_retries, on_error=on_error)
+    if _budget_engine is not None:
+        # Re-init: the old engine holds a pooled client bound to the
+        # previous endpoint/key. Its snapshot is stale by definition.
+        _budget_engine.close()
+    _budget_engine = (
+        BudgetEngine(config) if config.enforcement_mode == "local" else None
+    )
+    _emitter = Emitter(
+        config,
+        max_retries=max_retries,
+        on_error=on_error,
+        budget_engine=_budget_engine,
+    )
     _emitter.start()
 
     _router = Router(config) if enable_routing else None
     _analyzer = PromptAnalyzer(config) if enable_prompt_analysis else None
 
-    _interceptor = Interceptor(config, _emitter, _router, _analyzer)
+    if _budget_engine is not None:
+        # Before the first patched call, not after: a short-lived process
+        # would otherwise make every call it will ever make before the
+        # emitter's first flush ever fetched a snapshot.
+        _budget_engine.prime()
+
+    _interceptor = Interceptor(config, _emitter, _router, _analyzer, _budget_engine)
     _interceptor.install()
 
     if debug:

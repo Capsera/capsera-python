@@ -48,6 +48,8 @@ from uuid import uuid4
 import httpx
 
 from . import _catalog
+from ._budget_engine import MODE_OFF, MODE_STRICT, BudgetEngine, raise_if_blocked
+from ._budget_rules import ACTION_DOWNGRADE, PreflightRequest
 from ._config import Config
 from ._context import _context_stack
 from ._emitter import Emitter
@@ -74,6 +76,7 @@ config: Config = None  # type: ignore[assignment]  # set by Interceptor.install(
 emitter: Emitter = None  # type: ignore[assignment]  # set by Interceptor.install()
 router: Router | None = None
 analyzer: PromptAnalyzer | None = None
+budget_engine: BudgetEngine | None = None
 
 # Frames belonging to these path fragments are skipped when identifying the
 # true caller in the user's code.
@@ -394,11 +397,13 @@ class Interceptor:
         emitter: Emitter,
         router: Router | None = None,
         analyzer: PromptAnalyzer | None = None,
+        budget_engine: BudgetEngine | None = None,
     ) -> None:
         self._config = config
         self._emitter = emitter
         self._router = router
         self._analyzer = analyzer
+        self._budget_engine = budget_engine
 
     # ------------------------------------------------------------------ #
     # Public entry point
@@ -413,11 +418,12 @@ class Interceptor:
         capsera.init() calls take effect instead of leaving closures bound to
         a retired emitter.
         """
-        global config, emitter, router, analyzer
+        global config, emitter, router, analyzer, budget_engine
         config = self._config
         emitter = self._emitter
         router = self._router
         analyzer = self._analyzer
+        budget_engine = self._budget_engine
 
     def install(self) -> None:
         """Attempt to patch every known provider; silently skip missing ones."""
@@ -1864,42 +1870,61 @@ def _estimate_request_cost(kwargs: dict[str, Any], provider: str, prompt_meta: P
         return 0.0
 
 
-def _budget_check_payload(
+def _preflight_request(
     kwargs: dict[str, Any],
     provider: str,
     config: Config,
     prompt_meta: PromptMetadata | None,
-) -> dict[str, Any]:
+) -> PreflightRequest:
     ctx = _context_stack.current()
-    agent_id = (ctx.agent if ctx else None) or config.default_agent or "unknown"
-    team_id = (ctx.team if ctx else None) or config.default_team
-    task_type = ctx.task_type if ctx else None
+    return PreflightRequest(
+        agent_id=(ctx.agent if ctx else None) or config.default_agent or "unknown",
+        team_id=(ctx.team if ctx else None) or config.default_team,
+        customer_id=ctx.customer_id if ctx else None,
+        model=kwargs.get("model"),
+        provider=provider,
+        estimated_cost_usd=_estimate_request_cost(kwargs, provider, prompt_meta),
+    )
+
+
+def _strict_payload(request: PreflightRequest, config: Config) -> dict[str, Any]:
+    """The wire shape ``/v1/budgets/check`` expects, for strict mode."""
+    ctx = _context_stack.current()
     return {
-        "agent_id": agent_id,
-        "team_id": team_id,
-        "task_type": task_type,
-        "customer_id": ctx.customer_id if ctx else None,
+        "agent_id": request.agent_id,
+        "team_id": request.team_id,
+        "task_type": ctx.task_type if ctx else None,
+        "customer_id": request.customer_id,
         "cost_center": ctx.cost_center if ctx else None,
-        "model": kwargs.get("model"),
-        "provider": provider,
-        "estimated_cost_usd": _estimate_request_cost(kwargs, provider, prompt_meta),
+        "model": request.model,
+        "provider": request.provider,
+        "estimated_cost_usd": request.estimated_cost_usd,
     }
 
 
-def _raise_if_blocked(decision: dict[str, Any]) -> None:
+def _raise_if_blocked(decision: dict[str, Any], agent_id: str | None = None) -> None:
+    """Raise on a block verdict, with the decision attached.
+
+    ``agent_id`` is stamped in here rather than by the predicate: which budget
+    was tripped is a property of the decision, but *who* tripped it is context
+    only the interceptor holds, and it is the first thing a caller handling
+    this exception wants to log.
+    """
     if decision.get("allowed", True):
         return
-    message = decision.get("message") or "Capsera blocked this LLM call."
-    raise BudgetExceededError(message)
+    if agent_id and "agent_id" not in decision:
+        decision = {**decision, "agent_id": agent_id}
+    raise_if_blocked(decision)
 
 
 def _apply_preflight_decision(
     kwargs: dict[str, Any],
     decision: dict[str, Any],
     config: Config,
+    agent_id: str | None = None,
 ) -> str | None:
-    _raise_if_blocked(decision)
-    if decision.get("action") != "downgrade":
+    _raise_if_blocked(decision, agent_id)
+    if decision.get("action") != ACTION_DOWNGRADE:
         return None
 
     target_model = decision.get("target_model")
@@ -1918,12 +1943,13 @@ def _apply_preflight_decision(
 
 
 # --------------------------------------------------------------------------- #
-# Pooled HTTP clients for the pre-call budget check
+# Pooled HTTP clients for STRICT-mode budget checks
 #
-# Budget enforcement runs on the hot path of every LLM call (it is on by
-# default), so we reuse a single connection-pooled client instead of building
-# and tearing one down per call. The sync client is thread-safe and shared
-# process-wide; async clients are bound to an event loop, so we keep one per
+# Only strict mode still calls the backend per LLM request; the default local
+# mode answers from a cached snapshot and never reaches this code. Strict mode
+# puts a round trip on the caller's hot path by definition, so the least it can
+# do is reuse a connection: the sync client is thread-safe and shared
+# process-wide, and async clients are bound to an event loop so we keep one per
 # running loop. Clients are keyed by (endpoint, api_key, timeout) and rebuilt
 # transparently if init() is called again with different settings.
 # --------------------------------------------------------------------------- #
@@ -2007,16 +2033,42 @@ def _enforce_budget(
     config: Config,
     prompt_meta: PromptMetadata | None,
 ) -> str | None:
-    if not config.enable_budget_enforcement:
+    """Decide whether this call may proceed, before the provider sees it.
+
+    Returns the original model name if the call was downgraded (so the event
+    can record what it would have been), None otherwise. Raises
+    ``BudgetExceededError`` only for a genuine ``block`` verdict.
+
+    In the default local mode this is pure CPU — a scan over the workspace's
+    budgets against a background-refreshed snapshot, no I/O — which is the
+    whole point: the previous implementation put an HTTP round trip and our
+    own availability in front of every one of the customer's LLM calls.
+    Strict mode keeps that round trip for callers who want zero overshoot.
+
+    Fail-open is not an accident here. Any failure other than a real block
+    lets the call through, because an enforcement layer that breaks the host
+    application is a worse outcome than one that occasionally misses a cap.
+    """
+    mode = config.enforcement_mode
+    if mode == MODE_OFF:
         return None
     try:
-        client = _get_sync_budget_client(config)
-        resp = client.post(
-            "/v1/budgets/check",
-            json=_budget_check_payload(kwargs, provider, config, prompt_meta),
-        )
-        if resp.status_code == 200:
-            return _apply_preflight_decision(kwargs, resp.json(), config)
+        request = _preflight_request(kwargs, provider, config, prompt_meta)
+        if mode == MODE_STRICT:
+            decision = _strict_check(request, config)
+        else:
+            engine = budget_engine
+            if engine is None:
+                return None
+            decision = engine.decide(request)
+            if not decision.get("allowed", True):
+                # Strict mode's alert is written by the backend as it answers.
+                # Local mode never asks, so the refusal has to be reported on
+                # the next flush or it is never announced at all.
+                engine.record_block(decision, request)
+        if decision is None:
+            return None
+        return _apply_preflight_decision(kwargs, decision, config, request.agent_id)
     except BudgetExceededError:
         raise
     except Exception:
@@ -2030,21 +2082,40 @@ async def _enforce_budget_async(
     config: Config,
     prompt_meta: PromptMetadata | None,
 ) -> str | None:
-    if not config.enable_budget_enforcement:
-        return None
+    """Async counterpart of ``_enforce_budget``.
+
+    In local mode there is nothing to await — the decision is a synchronous
+    computation — so this delegates. Only strict mode needs the event loop,
+    and only because it makes a request.
+    """
+    mode = config.enforcement_mode
+    if mode != MODE_STRICT:
+        return _enforce_budget(kwargs, provider, config, prompt_meta)
     try:
-        client = _get_async_budget_client(config)
-        resp = await client.post(
-            "/v1/budgets/check",
-            json=_budget_check_payload(kwargs, provider, config, prompt_meta),
-        )
-        if resp.status_code == 200:
-            return _apply_preflight_decision(kwargs, resp.json(), config)
+        request = _preflight_request(kwargs, provider, config, prompt_meta)
+        decision = await _strict_check_async(request, config)
+        if decision is None:
+            return None
+        return _apply_preflight_decision(kwargs, decision, config, request.agent_id)
     except BudgetExceededError:
         raise
     except Exception:
         logger.debug("capsera: budget preflight failed — passing through", exc_info=True)
     return None
+
+
+def _strict_check(request: PreflightRequest, config: Config) -> dict[str, Any] | None:
+    client = _get_sync_budget_client(config)
+    resp = client.post("/v1/budgets/check", json=_strict_payload(request, config))
+    return resp.json() if resp.status_code == 200 else None
+
+
+async def _strict_check_async(
+    request: PreflightRequest, config: Config
+) -> dict[str, Any] | None:
+    client = _get_async_budget_client(config)
+    resp = await client.post("/v1/budgets/check", json=_strict_payload(request, config))
+    return resp.json() if resp.status_code == 200 else None
 
 
 def _maybe_route(

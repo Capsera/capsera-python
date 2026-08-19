@@ -6,6 +6,7 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 
@@ -26,10 +27,16 @@ class Emitter:
         config: Config,
         max_retries: int = 3,
         on_error: Callable[[str], None] | None = None,
+        budget_engine: Any | None = None,
     ) -> None:
         self._config = config
         self._max_retries = max_retries
         self._on_error = on_error
+        # The local budget engine, when enforcement is on. The emitter drives
+        # it because the emitter is where the two facts it needs already pass
+        # through: every completed call (to count as unreported spend) and
+        # every backend response (which carries a fresh snapshot).
+        self._budget_engine = budget_engine
         self._queue: queue.Queue[TokenEvent] = queue.Queue(maxsize=self._QUEUE_MAXSIZE)
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -90,6 +97,11 @@ class Emitter:
     # ------------------------------------------------------------------ #
 
     def enqueue(self, event: TokenEvent) -> None:
+        # Before the drop checks below, deliberately: the money was spent
+        # whether or not we manage to report it, and the local budget engine
+        # is enforcing against reality, not against what we shipped.
+        self._budget_hook("record_event", event)
+
         if self._limit_reached:
             now = datetime.now(UTC).strftime("%Y-%m")
             if self._limit_resets_at and now <= self._limit_resets_at:
@@ -158,13 +170,21 @@ class Emitter:
         while not self._stop_event.wait(timeout=interval):
             try:
                 self.flush()
+                # Covers what the ingest response cannot: a process that has
+                # not flushed yet, and one idle long enough that a sibling may
+                # have moved a shared budget. Cheap — the engine decides
+                # whether a fetch is actually due.
+                self._budget_hook("maybe_refresh")
             except Exception:
                 # Never let an exception kill the background thread.
                 if self._config.debug:
                     logger.exception("capsera: unexpected error in emitter worker")
 
     def _send(self, events: list[TokenEvent]) -> None:
-        payload = {"events": [e.to_dict() for e in events]}
+        payload: dict[str, Any] = {"events": [e.to_dict() for e in events]}
+        blocks = self._drain_blocks()
+        if blocks:
+            payload["blocks"] = blocks
         delays = [1, 2, 4]
         was_circuit_open = self._consecutive_failures >= self._FAILURE_THRESHOLD
 
@@ -177,6 +197,11 @@ class Emitter:
                         logger.info("capsera: circuit closed, resuming delivery")
                     self._consecutive_failures = 0
                     self._limit_reached = False
+                    # The backend has now recorded these events, and the
+                    # snapshot it just returned includes them — so stop
+                    # counting them locally or they are counted twice.
+                    self._apply_snapshot(resp)
+                    self._budget_hook("settle_events", events)
                     if self._config.debug:
                         logger.info("capsera: sent %d event(s) → status=%d", len(events), resp.status_code)
                     return
@@ -194,6 +219,10 @@ class Emitter:
                     msg = f"capsera: monthly event limit reached (resets {resets_at or 'next month'}). Events will not be tracked."
                     logger.warning(msg)
                     self._notify(msg)
+                    # Never going to be recorded, so holding them in the ledger
+                    # would tighten every local budget forever. Undercounting
+                    # beats killing a healthy agent — see capsera._ledger.
+                    self._budget_hook("settle_events", events)
                     return
 
                 if 400 <= resp.status_code < 500:
@@ -206,6 +235,7 @@ class Emitter:
                     )
                     logger.warning(msg)
                     self._notify(msg)
+                    self._budget_hook("settle_events", events)
                     return
 
                 self._record_failure()
@@ -248,6 +278,42 @@ class Emitter:
         )
         logger.warning(msg)
         self._notify(msg)
+
+    def _drain_blocks(self) -> list[dict[str, Any]]:
+        """Locally-refused calls to report alongside this batch."""
+        engine = self._budget_engine
+        if engine is None:
+            return []
+        try:
+            return engine.drain_blocks()
+        except Exception:
+            logger.debug("capsera: could not drain block reports", exc_info=True)
+            return []
+
+    def _budget_hook(self, method: str, *args: Any) -> None:
+        """Call into the budget engine, swallowing anything it raises.
+
+        Delivery is the emitter's job; enforcement bookkeeping is a passenger
+        on it. A bug in the engine must not stop events reaching the backend,
+        and must never surface on the caller's thread through enqueue().
+        """
+        engine = self._budget_engine
+        if engine is None:
+            return
+        try:
+            getattr(engine, method)(*args)
+        except Exception:
+            logger.debug("capsera: budget engine %s failed", method, exc_info=True)
+
+    def _apply_snapshot(self, resp: httpx.Response) -> None:
+        if self._budget_engine is None:
+            return
+        try:
+            body = resp.json()
+        except Exception:
+            return
+        if isinstance(body, dict):
+            self._budget_hook("apply_snapshot", body.get("budget_snapshot"))
 
     def _record_failure(self) -> None:
         self._consecutive_failures += 1

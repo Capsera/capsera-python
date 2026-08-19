@@ -57,6 +57,7 @@ def test_enforce_budget_raises_when_backend_blocks(monkeypatch: pytest.MonkeyPat
         endpoint="http://localhost:8000",
         default_agent="agent-1",
         enable_budget_enforcement=True,
+        enforcement_mode="strict",
     )
 
     with pytest.raises(BudgetExceededError, match="Budget would be exceeded"):
@@ -86,6 +87,7 @@ def test_enforce_budget_applies_backend_downgrade(monkeypatch: pytest.MonkeyPatc
         endpoint="http://localhost:8000",
         default_agent="agent-1",
         enable_budget_enforcement=True,
+        enforcement_mode="strict",
     )
     kwargs = {"model": "claude-sonnet-4-6", "max_tokens": 100}
 
@@ -110,6 +112,7 @@ def test_enforce_budget_skips_downgrade_for_critical_task(monkeypatch: pytest.Mo
         default_agent="agent-1",
         critical_task_types=["reasoning"],
         enable_budget_enforcement=True,
+        enforcement_mode="strict",
     )
     kwargs = {"model": "claude-sonnet-4-6", "max_tokens": 100}
     _context_stack.push(AgentContext(agent="agent-1", task_type="reasoning", customer_id="customer-a"))

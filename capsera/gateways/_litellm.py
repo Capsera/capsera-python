@@ -419,22 +419,23 @@ def _preflight_args(kwargs: dict[str, Any]) -> tuple[dict[str, Any], str]:
 def _budget_preflight_sync(kwargs: dict[str, Any]) -> None:
     """Capsera pre-call budget check for a litellm entry point.
 
-    Blocks (raises BudgetExceededError) when a blocking budget matches;
-    margin downgrades are deliberately not applied at this layer. Fail-open
-    on any transport/backend error.
+    Delegates to the interceptor's enforcement rather than re-implementing it,
+    so a litellm-routed call gets exactly the decision a direct provider call
+    would — including the local engine, which means no round trip here either.
+
+    Margin downgrades still do not take effect at this layer, and now by
+    construction rather than by omission: enforcement applies a downgrade by
+    rewriting ``model`` on the dict it is handed, and what it is handed is the
+    derived ``check_kwargs``, not litellm's real kwargs. The vendor-prefixed
+    model string the caller passed is left alone. Blocks propagate; everything
+    else fails open.
     """
     cfg = _runtime.config
-    if cfg is None or not cfg.enable_budget_enforcement:
+    if cfg is None:
         return
     try:
         check_kwargs, provider = _preflight_args(kwargs)
-        client = _runtime._get_sync_budget_client(cfg)
-        resp = client.post(
-            "/v1/budgets/check",
-            json=_runtime._budget_check_payload(check_kwargs, provider, cfg, None),
-        )
-        if resp.status_code == 200:
-            _runtime._raise_if_blocked(resp.json())
+        _runtime._enforce_budget(check_kwargs, provider, cfg, None)
     except BudgetExceededError:
         raise
     except Exception:  # noqa: BLE001
@@ -442,18 +443,13 @@ def _budget_preflight_sync(kwargs: dict[str, Any]) -> None:
 
 
 async def _budget_preflight_async(kwargs: dict[str, Any]) -> None:
+    """Async counterpart. See ``_budget_preflight_sync``."""
     cfg = _runtime.config
-    if cfg is None or not cfg.enable_budget_enforcement:
+    if cfg is None:
         return
     try:
         check_kwargs, provider = _preflight_args(kwargs)
-        client = _runtime._get_async_budget_client(cfg)
-        resp = await client.post(
-            "/v1/budgets/check",
-            json=_runtime._budget_check_payload(check_kwargs, provider, cfg, None),
-        )
-        if resp.status_code == 200:
-            _runtime._raise_if_blocked(resp.json())
+        await _runtime._enforce_budget_async(check_kwargs, provider, cfg, None)
     except BudgetExceededError:
         raise
     except Exception:  # noqa: BLE001

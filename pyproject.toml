@@ -95,6 +95,14 @@ test-frameworks = [
 [tool.hatch.build.targets.wheel]
 packages = ["capsera"]
 
+# Allowlist, not blocklist: the sdist otherwise packages the whole directory,
+# and the repo-root .gitignore (with its *.env rule) sits outside this project
+# dir, so hatchling never applies it. A stray local file (sdk/.env) shipped
+# inside the 0.5.0 sdist this way and leaked a PyPI token.
+# (pyproject.toml, README, LICENSE are always included automatically.)
+[tool.hatch.build.targets.sdist]
+only-include = ["capsera", "tests", "examples", "NOTICE"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

@@ -12,7 +12,44 @@ from typing import Any
 
 
 class BudgetExceededError(RuntimeError):
-    """Raised when pre-call budget enforcement blocks an LLM request."""
+    """Raised when pre-call budget enforcement blocks an LLM request.
+
+    Carries the decision as structured attributes, not just a message. A
+    partner catching this has three sensible responses — downgrade to a
+    cheaper model, queue the work for the next period, or fail loudly — and
+    choosing between them means branching on *which* budget stopped the call
+    and by how much. Parsing that back out of a formatted string is the kind
+    of thing that works until the wording changes.
+
+        try:
+            client.messages.create(...)
+        except capsera.BudgetExceededError as exc:
+            if exc.pct_used < 1.2:          # only just over — downgrade
+                client.messages.create(model="claude-haiku-4-5", ...)
+            else:
+                queue_for_next_period(task, budget=exc.budget_name)
+
+    Every field is optional: the exception must still be constructible from a
+    bare message, because a block that arrives without a full decision payload
+    (an older backend in strict mode, say) has to raise *something* and the
+    caller's ``except`` clause must not itself raise an AttributeError.
+    """
+
+    def __init__(self, message: str, decision: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        data = decision or {}
+        self.decision: dict[str, Any] = data
+        self.action: str | None = data.get("action")
+        self.budget_id: str | None = data.get("budget_id")
+        self.budget_name: str | None = data.get("budget_name")
+        self.limit_usd: float | None = data.get("limit_usd")
+        self.current_spend_usd: float | None = data.get("current_spend_usd")
+        self.projected_spend_usd: float | None = data.get("projected_spend_usd")
+        self.pct_used: float | None = data.get("pct_used")
+        self.customer_id: str | None = data.get("customer_id")
+        # Set by the interceptor, which knows the attribution context; the
+        # decision payload is about the budget, not about who tripped it.
+        self.agent_id: str | None = data.get("agent_id")
 
 
 # Backend ingest contract limits (backend/app/schemas/event.py). A field
