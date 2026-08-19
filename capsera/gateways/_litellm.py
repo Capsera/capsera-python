@@ -42,6 +42,7 @@ from .._catalog import provider_for, strip_vendor_prefix
 from .._context import AgentContext, _context_stack
 from .._models import BudgetExceededError, TokenEvent
 from .._pricing import compute_cost
+from .._usage import cached_is_included, split_cached_input
 
 # The interceptor runtime MODULE (config/emitter globals are republished on
 # re-init, so they must be read as module attributes at call time). Resolved
@@ -247,16 +248,32 @@ def emit_event(
         model = strip_vendor_prefix(model or raw_model) or "unknown"
 
         in_tok = out_tok = cache_read = cache_write = 0
+        anthropic_shaped = False
         if usage is not None and not is_error:
             in_tok = int(_uget(usage, "prompt_tokens") or _uget(usage, "input_tokens") or 0)
             out_tok = int(_uget(usage, "completion_tokens") or _uget(usage, "output_tokens") or 0)
+            # litellm passes the upstream usage object through, so which field
+            # is present tells us which shape we are looking at — and that
+            # decides whether the cached count is already inside in_tok.
             cache_read = int(_uget(usage, "cache_read_input_tokens") or 0)
+            anthropic_shaped = cache_read > 0
             if not cache_read:
                 details = _uget(usage, "prompt_tokens_details")
                 cache_read = int(_uget(details, "cached_tokens") or 0)
             cache_write = int(_uget(usage, "cache_creation_input_tokens") or 0)
+            anthropic_shaped = anthropic_shaped or cache_write > 0
 
         provider = _resolve_provider(litellm_params, raw_model, model)
+
+        # Without this, a cached OpenAI-shaped call bills its cached tokens
+        # twice in the fallback cost path: once inside prompt_tokens at the
+        # input rate, once beside it at the cache rate. Anthropic-shaped usage
+        # reports the buckets disjointly and must be left alone.
+        in_tok, cache_read = split_cached_input(
+            in_tok,
+            cache_read,
+            included=not anthropic_shaped and cached_is_included(provider),
+        )
 
         if is_error:
             cost = 0.0

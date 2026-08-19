@@ -57,6 +57,12 @@ from ._models import BudgetExceededError, PromptMetadata, TokenEvent
 from ._pricing import compute_cost
 from ._prompt_analyzer import PromptAnalyzer
 from ._router import Router
+from ._usage import (
+    cached_is_included,
+    gemini_cached_tokens,
+    openai_cached_tokens,
+    split_cached_input,
+)
 from ._version import __version__
 
 logger = logging.getLogger("capsera")
@@ -1613,7 +1619,7 @@ def _emit_native_response(
     """
     try:
         model = fallback_model
-        in_tok = out_tok = 0
+        in_tok = out_tok = cache_read = 0
 
         if style == "bedrock_converse" and isinstance(response, dict):
             usage = response.get("usage") or {}
@@ -1621,8 +1627,12 @@ def _emit_native_response(
             out_tok = int(usage.get("outputTokens", 0) or 0)
         elif style == "google_usage":
             um = getattr(response, "usage_metadata", None)
-            in_tok = int(getattr(um, "prompt_token_count", 0) or 0)
             out_tok = int(getattr(um, "candidates_token_count", 0) or 0)
+            in_tok, cache_read = split_cached_input(
+                int(getattr(um, "prompt_token_count", 0) or 0),
+                gemini_cached_tokens(um),
+                included=cached_is_included(provider),
+            )
             model = getattr(response, "model", None) or model
         elif style == "cohere":
             usage = getattr(response, "usage", None)
@@ -1634,8 +1644,12 @@ def _emit_native_response(
             if not hasattr(response, "usage") and hasattr(response, "parse"):
                 response = response.parse()
             usage = getattr(response, "usage", None)
-            in_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
             out_tok = int(getattr(usage, "completion_tokens", 0) or 0)
+            in_tok, cache_read = split_cached_input(
+                int(getattr(usage, "prompt_tokens", 0) or 0),
+                openai_cached_tokens(usage),
+                included=cached_is_included(provider),
+            )
             model = getattr(response, "model", None) or model
 
         event = _build_event(
@@ -1643,7 +1657,7 @@ def _emit_native_response(
             provider=provider,
             input_tokens=in_tok,
             output_tokens=out_tok,
-            cache_read_tokens=0,
+            cache_read_tokens=cache_read,
             cache_write_tokens=0,
             latency_ms=latency_ms,
             config=config,
@@ -1717,12 +1731,20 @@ def _emit_openai_response(
             response = response.parse()
         usage = response.usage
         model = getattr(response, "model", request_kwargs.get("model", "unknown"))
+        # prompt_tokens already contains the cached ones — see capsera._usage.
+        input_tokens, cache_read_tokens = split_cached_input(
+            getattr(usage, "prompt_tokens", 0),
+            openai_cached_tokens(usage),
+            included=cached_is_included(provider),
+        )
         event = _build_event(
             model=model,
             provider=provider,
-            input_tokens=getattr(usage, "prompt_tokens", 0),
+            input_tokens=input_tokens,
             output_tokens=getattr(usage, "completion_tokens", 0),
-            cache_read_tokens=0,
+            cache_read_tokens=cache_read_tokens,
+            # OpenAI caches automatically and bills no write premium, so there
+            # is no creation count to record.
             cache_write_tokens=0,
             latency_ms=latency_ms,
             config=config,
@@ -1748,7 +1770,12 @@ def _emit_openai_embedding_response(
     provider: str = "openai",
     gateway: str | None = None,
 ) -> None:
-    """Extract usage from an OpenAI Embedding response and enqueue an event."""
+    """Extract usage from an OpenAI Embedding response and enqueue an event.
+
+    The embeddings API has no prompt caching, so the zero cache counts below
+    are the true values rather than an unfilled gap like the ones capsera._usage
+    exists to close.
+    """
     try:
         if not hasattr(response, "usage") and hasattr(response, "parse"):
             response = response.parse()
@@ -1800,8 +1827,13 @@ def _emit_google_response(
     """Extract usage from a Google Gemini response and enqueue an event."""
     try:
         meta = getattr(response, "usage_metadata", None)
-        input_tokens = getattr(meta, "prompt_token_count", 0) if meta else 0
         output_tokens = getattr(meta, "candidates_token_count", 0) if meta else 0
+        # prompt_token_count includes cached content — see capsera._usage.
+        input_tokens, cache_read_tokens = split_cached_input(
+            getattr(meta, "prompt_token_count", 0) if meta else 0,
+            gemini_cached_tokens(meta),
+            included=cached_is_included("google"),
+        )
         # Prefer the concrete resolved model over the requested name: apps
         # calling rolling aliases ("gemini-flash-lite-latest") must be billed
         # against the model that actually served them (model_version).
@@ -1816,7 +1848,9 @@ def _emit_google_response(
             provider="google",
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            cache_read_tokens=0,
+            cache_read_tokens=cache_read_tokens,
+            # Gemini bills explicit context caching by storage-hour, not per
+            # written token, so there is no per-call write count to record.
             cache_write_tokens=0,
             latency_ms=latency_ms,
             config=config,
@@ -2354,12 +2388,19 @@ class _OpenAIStreamWrapper:
             return
         latency_ms = int((time.perf_counter() - self._start_time) * 1000)
         try:
+            # Usage arrives on the final chunk and carries the same cached
+            # split as a non-streamed response.
+            input_tokens, cache_read_tokens = split_cached_input(
+                getattr(self._last_usage, "prompt_tokens", 0),
+                openai_cached_tokens(self._last_usage),
+                included=cached_is_included(self._provider),
+            )
             event = _build_event(
                 model=self._last_model,
                 provider=self._provider,
-                input_tokens=getattr(self._last_usage, "prompt_tokens", 0),
+                input_tokens=input_tokens,
                 output_tokens=getattr(self._last_usage, "completion_tokens", 0),
-                cache_read_tokens=0,
+                cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=0,
                 latency_ms=latency_ms,
                 config=self._config,
@@ -2428,12 +2469,19 @@ class _OpenAIAsyncStreamWrapper:
             return
         latency_ms = int((time.perf_counter() - self._start_time) * 1000)
         try:
+            # Usage arrives on the final chunk and carries the same cached
+            # split as a non-streamed response.
+            input_tokens, cache_read_tokens = split_cached_input(
+                getattr(self._last_usage, "prompt_tokens", 0),
+                openai_cached_tokens(self._last_usage),
+                included=cached_is_included(self._provider),
+            )
             event = _build_event(
                 model=self._last_model,
                 provider=self._provider,
-                input_tokens=getattr(self._last_usage, "prompt_tokens", 0),
+                input_tokens=input_tokens,
                 output_tokens=getattr(self._last_usage, "completion_tokens", 0),
-                cache_read_tokens=0,
+                cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=0,
                 latency_ms=latency_ms,
                 config=self._config,

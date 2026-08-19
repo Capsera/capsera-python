@@ -414,11 +414,32 @@ def compute_cost(
     """
     pricing = get_pricing(model)
 
+    # A model with no cached rate is a gap in the table, not a free cache.
+    # Cached tokens are now split out of the prompt total for every provider,
+    # so multiplying them by a missing (zero) rate would take real spend to
+    # zero and under-report — trading the over-reporting bug for a quieter
+    # one. Falling back to the input rate reproduces exactly the number this
+    # model produced before the split existed, which makes adding the real
+    # rate a pure improvement rather than a correction.
+    cache_read_rate = pricing.cache_read_per_1k or pricing.input_per_1k
+    # Cache writes carry a premium over input, so the input rate under-states
+    # them. It is still the closest defensible stand-in for a missing entry.
+    cache_write_rate = pricing.cache_write_per_1k or pricing.input_per_1k
+
     input_cost = (Decimal(input_tokens) / Decimal("1000")) * pricing.input_per_1k
     output_cost = (Decimal(output_tokens) / Decimal("1000")) * pricing.output_per_1k
-    cache_read_cost = (Decimal(cache_read_tokens) / Decimal("1000")) * pricing.cache_read_per_1k
-    cache_write_cost = (
-        (Decimal(cache_write_tokens) / Decimal("1000")) * pricing.cache_write_per_1k
-    )
+    cache_read_cost = (Decimal(cache_read_tokens) / Decimal("1000")) * cache_read_rate
+    cache_write_cost = (Decimal(cache_write_tokens) / Decimal("1000")) * cache_write_rate
 
     return input_cost + output_cost + cache_read_cost + cache_write_cost
+
+
+def has_cache_rates(model: str) -> bool:
+    """Whether the table carries real cached rates for this model.
+
+    Lets a caller tell "cached tokens cost the same as input here" (a gap)
+    apart from "this model genuinely has no discount", which is what the
+    unpriced-call metric in the test plan needs to report on.
+    """
+    pricing = get_pricing(model)
+    return bool(pricing.cache_read_per_1k)
