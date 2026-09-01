@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 from decimal import Decimal
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -1011,3 +1012,60 @@ class TestTokenEventSerialization:
         d = ev.to_dict()
         assert d["team_id"] == "team-x"
         assert d["task_type"] == "summarisation"
+
+
+class TestCallerLocationPathIndependence:
+    """Caller resolution must not depend on what the customer named their
+    directories.
+
+    The SDK's own frames used to be matched by the path fragment "capsera",
+    which also matched any customer path *containing* that string — a company
+    of that name, a directory called `capsera-integration`, a venv under
+    `/opt/capsera/`. Every frame of their code was skipped and `caller_file`
+    came back "unknown", silently, with attribution simply absent. It
+    reproduced in this repository, whose checkout is named `capsera`, which is
+    how the eval pipeline surfaced it (FID-5 at 0%).
+    """
+
+    def test_sdk_frames_are_matched_by_module_not_path(self) -> None:
+        import importlib
+
+        module = importlib.import_module("capsera._interceptor")
+        module._skip_fragments_initialized = False
+        fragments = module._detect_frameworks()
+        module._skip_fragments_initialized = False
+
+        assert "capsera" not in fragments, (
+            "a bare 'capsera' path fragment matches customer directories too"
+        )
+
+    def test_caller_resolves_from_a_path_containing_the_sdk_name(self, tmp_path) -> None:
+        """Run user code from a directory called `capsera` and demand attribution."""
+        import importlib
+        import subprocess
+        import sys
+        import textwrap
+
+        module = importlib.import_module("capsera._interceptor")
+        sdk_root = str(Path(module.__file__).resolve().parent.parent)
+
+        app_dir = tmp_path / "capsera" / "customer-project"
+        app_dir.mkdir(parents=True)
+        app = app_dir / "app.py"
+        app.write_text(textwrap.dedent("""
+            import sys
+            sys.path.insert(0, sys.argv[1])
+            from capsera._interceptor import _caller_location
+            print(_caller_location())
+        """))
+
+        proc = subprocess.run(
+            [sys.executable, str(app), sdk_root],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        resolved = proc.stdout.strip()
+        assert resolved.startswith("app.py:"), (
+            f"expected the customer's own file, got {resolved!r} "
+            "(a path-fragment match would return 'unknown')"
+        )

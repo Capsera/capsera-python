@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import gc
 import inspect
 import logging
 import sys
@@ -86,8 +87,16 @@ budget_engine: BudgetEngine | None = None
 
 # Frames belonging to these path fragments are skipped when identifying the
 # true caller in the user's code.
+# Our own frames are identified by module name, not by path fragment. The
+# fragment "capsera" used to be in this list, and it matched any path
+# *containing* that string — so a customer whose project lives in a directory
+# called `capsera-integration`, or who works at a company of that name, had
+# every frame of their own code skipped and lost caller attribution entirely
+# (caller_file="unknown"). It reproduced in this repo, whose checkout is named
+# `capsera`, which is how the eval pipeline caught it.
+_SDK_ROOT_MODULE = __name__.split(".")[0]
+
 _SKIP_FRAME_FRAGMENTS_BASE = [
-    "capsera",
     "site-packages/anthropic",
     "site-packages/openai",
     "site-packages/google",
@@ -218,7 +227,11 @@ def _caller_location(stack_start: int = 1) -> str:
         frame = sys._getframe(stack_start)
         while frame is not None:
             filename = frame.f_code.co_filename
-            if not any(frag in filename for frag in skip):
+            # Module name for our own frames (exact, and immune to whatever the
+            # customer happens to have called their directories); path fragments
+            # for third-party packages, whose install location is what we know.
+            module_root = str(frame.f_globals.get("__name__", "")).split(".")[0]
+            if module_root != _SDK_ROOT_MODULE and not any(frag in filename for frag in skip):
                 short = filename.replace("\\", "/").split("/")[-1]
                 return f"{short}:{frame.f_lineno}"
             frame = frame.f_back
@@ -2034,6 +2047,17 @@ def _get_async_budget_client(config: Config) -> httpx.AsyncClient:
     key = _budget_client_key(config)
     loop = asyncio.get_running_loop()
     with _async_budget_clients_lock:
+        # Purge entries for CLOSED loops first. A closed loop can never be
+        # the running loop again, so its cached client is pure leak — and the
+        # weak keying alone cannot reclaim it: the client's pooled transports
+        # reference their loop, so the dict's strong VALUE pins its own weak
+        # KEY and the entry would otherwise be immortal. Left unpurged, one
+        # AsyncClient (+ pool + loop) leaks per closed loop on every
+        # platform, and the surviving proactor transports hard-crash
+        # interpreter finalization on Windows CPython <= 3.11.0 (CAP-BUG-1).
+        for cached_loop in list(_async_budget_clients.keys()):
+            if cached_loop.is_closed():
+                del _async_budget_clients[cached_loop]
         existing = _async_budget_clients.get(loop)
         if existing is not None and existing[0] == key:
             return existing[1]
@@ -2047,7 +2071,17 @@ def _get_async_budget_client(config: Config) -> httpx.AsyncClient:
 
 
 def _reset_budget_clients() -> None:
-    """Close and drop pooled budget-check clients (called on re-init)."""
+    """Close and drop pooled budget-check clients.
+
+    Called on re-init AND from ``capsera.shutdown()`` (so also at atexit).
+    The async clients are dropped, not ``aclose()``d — their loops are
+    usually closed by now, and transports close their sockets in ``__del__``;
+    what matters is WHEN they die. Dropping them here, while the interpreter
+    is fully alive, lets teardown happen at a safe time. Left to interpreter
+    finalization instead, the surviving proactor transports crash CPython
+    <= 3.11.0 on Windows with an access violation in
+    ``_ProactorBasePipeTransport.__del__`` (CAP-BUG-1).
+    """
     global _sync_budget_client, _sync_budget_client_key
     with _sync_budget_client_lock:
         if _sync_budget_client is not None:
@@ -2058,7 +2092,14 @@ def _reset_budget_clients() -> None:
         _sync_budget_client = None
         _sync_budget_client_key = None
     with _async_budget_clients_lock:
+        had_async = len(_async_budget_clients) > 0
         _async_budget_clients.clear()
+    if had_async:
+        # httpx client graphs contain reference cycles, so dropping our root
+        # only queues them for a FUTURE cyclic-GC pass — which could again be
+        # interpreter finalization. Collect now, at a provably safe time.
+        # Scoped to processes that actually used async budget preflight.
+        gc.collect()
 
 
 def _enforce_budget(

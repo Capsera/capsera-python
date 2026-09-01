@@ -564,6 +564,12 @@ def shutdown() -> None:
     """
     if _emitter:
         _emitter.shutdown()
+    # Drop pooled budget-preflight clients while the interpreter is still
+    # fully alive. Their pooled asyncio transports must not survive into
+    # interpreter finalization: on Windows CPython <= 3.11.0 that crashes the
+    # process with an access violation after an otherwise clean exit
+    # (CAP-BUG-1; see _interceptor._reset_budget_clients).
+    _reset_budget_clients()
 
 
 # Register a best-effort shutdown hook so events are flushed on normal exit.

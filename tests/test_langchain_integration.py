@@ -254,9 +254,12 @@ class TestFrameworkDetection:
 
         fragments = _detect_frameworks()
 
-        # Base fragments should always be present
-        assert "capsera" in fragments
+        # Base fragments should always be present. Note the SDK's own frames are
+        # NOT in this list: they are matched by module identity instead, because
+        # a bare "capsera" fragment also matched any customer directory
+        # containing that string and silently blanked their attribution.
         assert "site-packages/openai" in fragments
+        assert not any(f == "capsera" for f in fragments)
 
         # Reset for other tests
         _mod._skip_fragments_initialized = False

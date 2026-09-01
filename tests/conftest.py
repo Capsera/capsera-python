@@ -143,3 +143,30 @@ def _reset_pooled_budget_clients():
     _reset_budget_clients()
     yield
     _reset_budget_clients()
+
+@pytest.fixture(autouse=True)
+def _isolate_gateway_suppression():
+    """Restore the gateway-suppression set around every test.
+
+    `_GATEWAY_SUPPRESS_PACKAGES` is a module-level mutable set: once a gateway
+    integration is installed, provider-patch capture is suppressed for calls
+    originating inside that package, process-wide. Several test modules already
+    save and restore it by hand, and the ones that do not inherit whatever the
+    previous test left behind.
+
+    That produced a genuinely confusing failure —
+    `test_inner_openai_call_captured_when_litellm_not_installed` passed alone and
+    failed in a full-suite run, because by then "litellm" was still in the set
+    and the call it expected to be captured was suppressed. Restoring here fixes
+    the class of problem rather than that one instance, and costs a set copy per
+    test.
+    """
+    import importlib
+
+    runtime = importlib.import_module("capsera._interceptor")
+    saved = set(runtime._GATEWAY_SUPPRESS_PACKAGES)
+    try:
+        yield
+    finally:
+        runtime._GATEWAY_SUPPRESS_PACKAGES.clear()
+        runtime._GATEWAY_SUPPRESS_PACKAGES.update(saved)

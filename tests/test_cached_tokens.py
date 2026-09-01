@@ -131,22 +131,26 @@ def test_cache_write_carries_a_premium_over_input():
 
 
 def test_splitting_is_cost_neutral_where_no_cached_rate_is_known():
-    """gpt-4o has no cached rate in the table yet. Recording the split must
-    not change what it costs — otherwise shipping the capture fix would
-    silently zero out real spend, trading over-reporting for under-reporting."""
-    assert not has_cache_rates("gpt-4o")
-    unsplit = compute_cost("gpt-4o", "openai", 1000, 100)
-    split = compute_cost("gpt-4o", "openai", 600, 100, cache_read_tokens=400)
+    """A model with no cached rate in the table must cost the same split or
+    unsplit — otherwise shipping the capture fix would silently zero out real
+    spend, trading over-reporting for under-reporting. (Originally pinned on
+    gpt-4o; its verified rate has since landed, so the pin moved to a model
+    that genuinely still lacks one.)"""
+    assert not has_cache_rates("mistral-large-latest")
+    unsplit = compute_cost("mistral-large-latest", "mistral", 1000, 100)
+    split = compute_cost("mistral-large-latest", "mistral", 600, 100, cache_read_tokens=400)
     assert split == unsplit
 
 
 def test_a_missing_cached_rate_never_makes_cached_tokens_free():
-    assert compute_cost("gpt-4o", "openai", 0, 0, cache_read_tokens=1000) > 0
+    assert compute_cost("mistral-large-latest", "mistral", 0, 0, cache_read_tokens=1000) > 0
 
 
 def test_has_cache_rates_distinguishes_a_gap_from_a_real_rate():
     assert has_cache_rates("claude-sonnet-4-6") is True
-    assert has_cache_rates("gpt-4o") is False
+    # Verified rates landed for OpenAI/Gemini (see test_cost_golden.py).
+    assert has_cache_rates("gpt-4o") is True
+    assert has_cache_rates("mistral-large-latest") is False
 
 
 # --------------------------------------------------------------------------- #

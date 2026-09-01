@@ -95,21 +95,31 @@ PRICING: dict[str, ModelPricing] = {
         cache_write_per_1k=Decimal("0.01875"),
     ),
     # ── OpenAI ───────────────────────────────────────────────────────────
+    # Cached-input rates (prompt caching) are 50% of the input rate across
+    # the models that support it — verified against the OpenAI pricing page
+    # 2026-08-20 (gpt-4o $1.25/M cached vs $2.50/M input; gpt-4o-mini
+    # $0.075/M vs $0.15/M). OpenAI charges NO cache-write premium (caching
+    # is automatic), so cache_write stays 0. Older models (gpt-4, gpt-4-turbo,
+    # gpt-3.5) don't support prompt caching and never report cached tokens.
     "gpt-4o": ModelPricing(
         input_per_1k=Decimal("0.0025"),
         output_per_1k=Decimal("0.010"),
+        cache_read_per_1k=Decimal("0.00125"),
     ),
     "gpt-4o-2024-11-20": ModelPricing(
         input_per_1k=Decimal("0.0025"),
         output_per_1k=Decimal("0.010"),
+        cache_read_per_1k=Decimal("0.00125"),
     ),
     "gpt-4o-mini": ModelPricing(
         input_per_1k=Decimal("0.00015"),
         output_per_1k=Decimal("0.0006"),
+        cache_read_per_1k=Decimal("0.000075"),
     ),
     "gpt-4o-mini-2024-07-18": ModelPricing(
         input_per_1k=Decimal("0.00015"),
         output_per_1k=Decimal("0.0006"),
+        cache_read_per_1k=Decimal("0.000075"),
     ),
     "gpt-4-turbo": ModelPricing(
         input_per_1k=Decimal("0.010"),
@@ -130,14 +140,17 @@ PRICING: dict[str, ModelPricing] = {
     "o1": ModelPricing(
         input_per_1k=Decimal("0.015"),
         output_per_1k=Decimal("0.060"),
+        cache_read_per_1k=Decimal("0.0075"),
     ),
     "o1-mini": ModelPricing(
         input_per_1k=Decimal("0.003"),
         output_per_1k=Decimal("0.012"),
+        cache_read_per_1k=Decimal("0.0015"),
     ),
     "o3-mini": ModelPricing(
         input_per_1k=Decimal("0.0011"),
         output_per_1k=Decimal("0.0044"),
+        cache_read_per_1k=Decimal("0.00055"),
     ),
     # ── OpenAI Embeddings ────────────────────────────────────────────────
     "text-embedding-3-small": ModelPricing(
@@ -176,43 +189,59 @@ PRICING: dict[str, ModelPricing] = {
     # Gemini 2.5 family — Developer API rates (≤200k-token prompts), verified
     # live 2026-08-03; the 2.0 free tier is retired (limit: 0), so customers
     # on the Developer API are on 2.5 models.
+    # Context-caching (cached token) rates are 10% of the input rate —
+    # verified against ai.google.dev/gemini-api/docs/pricing 2026-08-20
+    # (2.5 Pro $0.125/M, 2.5 Flash $0.03/M, 2.5 Flash-Lite $0.01/M). The
+    # separate per-hour cache STORAGE fee is not visible in per-call usage
+    # metadata and is deliberately out of scope for per-call costing.
     "gemini-2.5-pro": ModelPricing(
         input_per_1k=Decimal("0.00125"),
         output_per_1k=Decimal("0.01"),
+        cache_read_per_1k=Decimal("0.000125"),
     ),
     "gemini-2.5-flash": ModelPricing(
         input_per_1k=Decimal("0.0003"),
         output_per_1k=Decimal("0.0025"),
+        cache_read_per_1k=Decimal("0.00003"),
     ),
     "gemini-2.5-flash-lite": ModelPricing(
         input_per_1k=Decimal("0.0001"),
         output_per_1k=Decimal("0.0004"),
+        cache_read_per_1k=Decimal("0.00001"),
     ),
     # Gemini 3.x family — Developer API paid-tier rates (≤200k-token prompts),
     # verified against ai.google.dev/gemini-api/docs/pricing on 2026-08-03.
+    # Cached-token rates follow the same 10%-of-input ratio the official
+    # pricing page lists across the 3.x family (spot-verified 2026-08-20).
     "gemini-3-pro": ModelPricing(
         input_per_1k=Decimal("0.002"),
         output_per_1k=Decimal("0.012"),
+        cache_read_per_1k=Decimal("0.0002"),
     ),
     "gemini-3-flash": ModelPricing(
         input_per_1k=Decimal("0.0005"),
         output_per_1k=Decimal("0.003"),
+        cache_read_per_1k=Decimal("0.00005"),
     ),
     "gemini-3.1-pro": ModelPricing(
         input_per_1k=Decimal("0.002"),
         output_per_1k=Decimal("0.012"),
+        cache_read_per_1k=Decimal("0.0002"),
     ),
     "gemini-3.1-flash-lite": ModelPricing(
         input_per_1k=Decimal("0.00025"),
         output_per_1k=Decimal("0.0015"),
+        cache_read_per_1k=Decimal("0.000025"),
     ),
     "gemini-3.5-flash": ModelPricing(
         input_per_1k=Decimal("0.0015"),
         output_per_1k=Decimal("0.009"),
+        cache_read_per_1k=Decimal("0.00015"),
     ),
     "gemini-3.5-flash-lite": ModelPricing(
         input_per_1k=Decimal("0.0003"),
         output_per_1k=Decimal("0.0025"),
+        cache_read_per_1k=Decimal("0.00003"),
     ),
     "gemini-3.6-flash": ModelPricing(
         input_per_1k=Decimal("0.0015"),
