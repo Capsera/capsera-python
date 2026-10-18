@@ -8,4 +8,4 @@ request headers. Bump it here and rebuild the wheel
 ``_WHEEL_FILENAME_FALLBACK`` in ``instrument/runner.py`` must follow — a
 test asserts it matches the staged wheel.
 """
-__version__ = "0.6.2"
+__version__ = "0.6.3"

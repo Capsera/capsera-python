@@ -58,6 +58,7 @@ from ._models import BudgetExceededError, PromptMetadata, TokenEvent
 from ._pricing import compute_cost
 from ._prompt_analyzer import PromptAnalyzer
 from ._router import Router
+from ._usage import _int as _usage_int
 from ._usage import (
     cached_is_included,
     gemini_cached_tokens,
@@ -1590,14 +1591,23 @@ def _emit_anthropic_response(
 ) -> None:
     """Extract usage from an Anthropic Message response and enqueue an event."""
     try:
+        # langchain-anthropic >= 1.7 calls messages.with_raw_response.create(),
+        # which hands the patched create a raw-response wrapper, not a Message.
+        # Reading .usage off it raised, the fail-open handler swallowed it, and
+        # every Claude call made through LangChain went unrecorded.
+        if not hasattr(response, "usage") and hasattr(response, "parse"):
+            response = response.parse()
         usage = response.usage
         event = _build_event(
             model=getattr(response, "model", request_kwargs.get("model", "unknown")),
             provider="anthropic",
             input_tokens=getattr(usage, "input_tokens", 0),
             output_tokens=getattr(usage, "output_tokens", 0),
-            cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0),
-            cache_write_tokens=getattr(usage, "cache_creation_input_tokens", 0),
+            # Present-but-None when a server omits them (the anthropic SDK's
+            # Usage defaults them to None); passed through, compute_cost raised
+            # on Decimal(None) and the whole event was dropped.
+            cache_read_tokens=_usage_int(getattr(usage, "cache_read_input_tokens", 0)),
+            cache_write_tokens=_usage_int(getattr(usage, "cache_creation_input_tokens", 0)),
             latency_ms=latency_ms,
             config=config,
             original_model=original_model,

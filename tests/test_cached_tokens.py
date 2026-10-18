@@ -235,3 +235,60 @@ def test_anthropic_response_keeps_its_buckets_additive(base_config, capturing_em
     (event,) = capturing_emitter.drain()
     assert event.input_tokens == 600
     assert event.cache_read_tokens == 400
+
+
+def _emit_anthropic(runtime, response, base_config, capturing_emitter):
+    runtime._emit_anthropic_response(
+        response=response,
+        request_kwargs={"model": "claude-sonnet-4-6"},
+        latency_ms=5,
+        config=base_config,
+        emitter=capturing_emitter,
+        original_model=None,
+        caller_file="app.py:1",
+    )
+    return capturing_emitter.drain()
+
+
+def test_anthropic_raw_response_wrapper_is_unwrapped(base_config, capturing_emitter):
+    """langchain-anthropic >= 1.7 calls messages.with_raw_response.create(), so
+    the patched create sees a raw-response wrapper (no .usage, has .parse()).
+    Reading .usage off it used to raise and the event was silently dropped."""
+    import importlib
+    from types import SimpleNamespace
+
+    runtime = importlib.import_module("capsera._interceptor")
+    inner = SimpleNamespace(
+        model="claude-sonnet-4-6",
+        usage=SimpleNamespace(
+            input_tokens=120, output_tokens=30,
+            cache_read_input_tokens=0, cache_creation_input_tokens=0,
+        ),
+    )
+    wrapper = SimpleNamespace(parse=lambda: inner)
+
+    (event,) = _emit_anthropic(runtime, wrapper, base_config, capturing_emitter)
+    assert (event.input_tokens, event.output_tokens) == (120, 30)
+    assert event.provider == "anthropic"
+
+
+def test_anthropic_null_cache_fields_still_record_the_call(base_config, capturing_emitter):
+    """The anthropic SDK's Usage defaults the cache counts to None when a
+    server omits them; passed through, compute_cost raised on Decimal(None)
+    and the whole event was dropped."""
+    import importlib
+    from types import SimpleNamespace
+
+    runtime = importlib.import_module("capsera._interceptor")
+    response = SimpleNamespace(
+        model="claude-sonnet-4-6",
+        usage=SimpleNamespace(
+            input_tokens=200, output_tokens=50,
+            cache_read_input_tokens=None, cache_creation_input_tokens=None,
+        ),
+    )
+
+    (event,) = _emit_anthropic(runtime, response, base_config, capturing_emitter)
+    assert event.input_tokens == 200
+    assert event.cache_read_tokens == 0 and event.cache_write_tokens == 0
+    assert event.cost_usd > 0
